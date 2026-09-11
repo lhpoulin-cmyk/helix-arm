@@ -7,7 +7,7 @@ This repository holds application documentation, the complete reliability patch 
 ## Documentation
 
 - [ChatGPT Work handoff: get Helix ARM running](docs/chatgpt-work-handoff.md)
-
+- [Executable rollout plan](docs/execution-plan.md)
 - [Current state](CURRENT_STATE.md)
 - [Application architecture and media policy](docs/application.md)
 - [Deployment and rollback](docs/deployment.md)

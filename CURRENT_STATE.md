@@ -1,5 +1,10 @@
 # Current state
 
+## 2026-09-11 — Custom-image bootstrap prepared
+
+A review branch now contains a bounded six-phase execution plan plus fail-closed source-preparation and image-build scripts. The source script pins the upstream and dependency commits and verifies the expected patched tree. The build script requires a digest-pinned `arm-dependencies` image and records image identity labels. Shell syntax was checked in ChatGPT Work; Docker, image, application, login, disc, and hardware acceptance remain unperformed. Guest Docker installation still requires the operator's local sudo authentication.
+
+
 ## 2026-09-11 — Reliability fixes imported; custom image required
 
 The operator requested merging the source fixes into Helix ARM. The complete two-commit patch series, including all 18 tests and upstream license, is now tracked under `patches/arm/`. Detailed source inventory and the original review are in `docs/source-changes.md` and `docs/source-review.md`. This supersedes the stock-image choice recorded below.

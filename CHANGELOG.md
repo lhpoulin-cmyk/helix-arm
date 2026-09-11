@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-11 — Custom-image bootstrap
+
+- Added a six-phase execution plan with owners, acceptance criteria, stop conditions, and state-preserving rollback.
+- Added fail-closed scripts for preparing the exact patched upstream tree and building from a digest-pinned dependency image.
+- Verified shell syntax only; Docker/image/dashboard/login/disc acceptance remains pending.
+
+
 ## 2026-09-11 — Source import and deployment handoff
 
 - Imported the complete reliability patch series, its 18 tests, upstream license, and detailed review/change inventory.
