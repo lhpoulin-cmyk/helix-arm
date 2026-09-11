@@ -8,6 +8,6 @@ Local branch `matrix/reliable-ingest` in `/srv/b70-encode/scratch/arm-evaluation
 
 The recorded changes cover retained logs, unique log names, combined MakeMKV diagnostics, exact nonempty output installation without replacement, propagated failures, and finite dashboard log viewing. The retained evidence at `/srv/b70-encode/evidence/20260910-arm-implementation/` reports 18 focused passing tests. Those tests do not establish full application, real-disc, browser, or GPU acceptance.
 
-A stock upstream image does not include the local changes. The initial appliance instructions request an unmodified upstream trial; the later trial runbook requests a patched image. Record an explicit baseline decision before deployment. Prefer upstream configuration and minimize ongoing custom maintenance.
+Decision, 2026-09-11: the operator requested a boring, normal Docker deployment. Use stock upstream ARM 2.24.3, pinned by image digest in compose.yaml. This supersedes the earlier proposal to build a custom patched image. The local patches remain archived in the appliance workspace and are not applied to this deployment. Their 18 passing tests do not validate the stock image. Retain the prior review findings as live acceptance concerns; prefer upstream configuration and minimize ongoing custom maintenance.
 
 Historical appliance references: `CURRENT_STATE.md`, `docs/arm-code-review-20260910.md`, and `docs/runbooks/arm-replacement-trial.md` in `/srv/b70-encode`. Preserve these records when moving future application documentation here.

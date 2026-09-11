@@ -1,0 +1,53 @@
+name: helix-arm
+services:
+  arm:
+    # Stock upstream release 2.24.3, pinned multi-platform image manifest.
+    image: automaticrippingmachine/automatic-ripping-machine@sha256:86fe834229039a9b2715fe7d6417729c9963fcb7fd606a482d1edf7caf3b5a5d
+    platform: linux/amd64
+    container_name: helix-arm
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ARM_UID: "1000"
+      ARM_GID: "1000"
+      TZ: Etc/UTC
+    volumes:
+      - type: bind
+        source: /srv/b70-encode/var/helix-arm/home
+        target: /home/arm
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/b70-encode/var/helix-arm/config
+        target: /etc/arm/config
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/b70-encode/var/helix-arm/logs
+        target: /home/arm/logs
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/media/work/helix-arm/media
+        target: /home/arm/media
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/media/work/helix-arm/music
+        target: /home/arm/music
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/login', timeout=5).read(1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    logging:
+      # Default json-file behavior retains service output without rotation.
+      driver: json-file
+
+# No optical devices are mapped until the new SATA drive is identified.
+# This starts only the dashboard. It cannot accept the ripping trial.
+# No GPU, Docker socket, source library, or output library is mounted.
