@@ -26,8 +26,8 @@ sudo docker image inspect automaticrippingmachine/arm-dependencies:1.8.0 \
 The output supplied to the build script must have the form `automaticrippingmachine/arm-dependencies@sha256:...`. Preserve it with the build evidence.
 
 ```bash
-./scripts/prepare-arm-source.sh
-sudo ./scripts/build-arm-image.sh \
+bash scripts/prepare-arm-source.sh
+sudo bash scripts/build-arm-image.sh \
   ./scratch/arm-patched \
   automaticrippingmachine/arm-dependencies@sha256:<recorded-digest>
 ```
