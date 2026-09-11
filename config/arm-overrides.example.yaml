@@ -1,0 +1,15 @@
+# Trial overrides for ARM 2.24.3. Merge into its generated configuration.
+# This fragment is not a complete runnable arm.yaml.
+# Paths, verified MakeMKV track-selection profile, and device access remain
+# deployment settings. COMPLETED_PATH must be unvalidated trial work storage.
+RIPMETHOD: mkv
+SKIP_TRANSCODE: true
+MAINFEATURE: false
+MINLENGTH: "0"
+MAXLENGTH: "99999"
+EXTRAS_SUB: extras
+DELRAWFILES: false
+LOGLIFE: 0
+EMBY_REFRESH: false
+NOTIFY_RIP: false
+NOTIFY_TRANSCODE: false
