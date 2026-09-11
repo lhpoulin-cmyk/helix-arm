@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-11 — Source import and deployment handoff
+
+- Imported the complete reliability patch series, its 18 tests, upstream license, and detailed review/change inventory.
+- Verified exact source-tree replay, passing tests, compilation, shell syntax, and whitespace checks.
+- Made a custom image an explicit deployment prerequisite; removed the implicit stock-image selection from Compose.
+- Added a ChatGPT Work handoff covering the fastest dashboard/login milestone, Docker/sudo prerequisites, SATA mapping, storage, encrypted secrets, live acceptance, and rollback.
+- No custom image was built and no runtime or source media was changed.
+
 ## 2026-09-11 — Docker preparation
 
 - Selected digest-pinned stock ARM 2.24.3 with Compose, superseding the custom-image proposal.

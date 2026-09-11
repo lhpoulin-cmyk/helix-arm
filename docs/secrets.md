@@ -25,6 +25,6 @@ Compose binds the dashboard to `127.0.0.1:8080` on the guest. From the operator'
 
 Initialize the database via upstream `/setup` if prompted, sign in with the encrypted bootstrap credential, and use `/update_password` to set the encrypted planned password. Verify logout/login and a failed attempt with the former password. Then change the encrypted application status and add a sanitized acceptance record.
 
-Source review of this release found a fixed Flask session signing key in `arm/ui/__init__.py`, with no supported configuration override. A strong administrator password does not change that key. This stock trial remains loopback-only; wider dashboard exposure needs a separate upstream/configuration review. No custom application patch is applied here.
+Source review of this release found a fixed Flask session signing key in `arm/ui/__init__.py`, with no supported configuration override. A strong administrator password does not change that key. The planned patched trial remains loopback-only because the imported reliability fixes do not change session signing; wider dashboard exposure needs a separate upstream/configuration review. The reliability patch series is now tracked in this repository, but no patched runtime image is built or installed.
 
 References: [SOPS documentation](https://getsops.io/docs/) and [official SOPS v3.13.3 release](https://github.com/getsops/sops/releases/tag/v3.13.3).

@@ -2,9 +2,9 @@
 
 ## Selected deployment
 
-Use one stock upstream ARM container with Docker Compose, Ubuntu Docker packages, UTC, restart-unless-stopped, persistent bind mounts, and a loopback dashboard on port 8080. No custom image build, auto-updater, reverse proxy, or external database. The operator's 2026-09-11 request for a normal Docker setup resolves the earlier custom-patch proposal in favor of stock upstream.
+Use one ARM container with Docker Compose, Ubuntu Docker packages, UTC, restart-unless-stopped, persistent bind mounts, and a loopback dashboard on port 8080. The operator subsequently requested that the reliability fixes be merged into Helix ARM. **A custom Docker image containing those fixes is now required and has not been built.** See [custom image](custom-image.md) before attempting startup.
 
-`compose.yaml` pins ARM 2.24.3 to multi-platform digest `sha256:86fe834229039a9b2715fe7d6417729c9963fcb7fd606a482d1edf7caf3b5a5d`, resolved from Docker Hub on 2026-09-11. Its amd64 digest is `sha256:71f38056bc22de5fa3588f6a239823bd60bfc2f09bee67e0ebc19d84fd8b69ee`. The image has not been pulled or run. Earlier locally patched tests do not certify this stock image.
+Compose requires `HELIX_ARM_IMAGE` and uses `pull_policy: never` so an unpatched stock image cannot be selected by default. Only set this variable to a locally built and validated image containing the complete patch series. The previous stock baseline was ARM 2.24.3, multi-platform digest `sha256:86fe834229039a9b2715fe7d6417729c9963fcb7fd606a482d1edf7caf3b5a5d`; that digest does not include our fixes and is not the deployment image.
 
 No optical device is mapped yet. The guest still sees the USB HL-DT-ST drive at `/dev/sr1`, now paired with `/dev/sg3`. `/dev/sr0` with `/dev/sg2` is the virtual QEMU drive, not the new physical SATA drive. The old appliance profile's `/dev/sg2` target is stale. Do not substitute either drive for the reported SATA drive. Controller assignment is a host/operator responsibility.
 
@@ -40,12 +40,11 @@ df -h /srv/b70-encode /mnt/media/work
 df -i /srv/b70-encode /mnt/media/work
 ```
 
-Confirm the exact work mount and reserve in [storage](storage.md), then:
+First build and validate the [custom image](custom-image.md), set `HELIX_ARM_IMAGE` in the root invocation environment or a local ignored `.env`, and confirm the exact work mount and reserve in [storage](storage.md). Then:
 
 ```bash
 cd /srv/b70-encode/scratch/helix-arm
 sudo docker compose config --quiet
-sudo docker compose pull
 sudo docker compose up -d --wait --wait-timeout 180
 sudo docker compose ps
 sudo docker compose logs --no-color
@@ -57,7 +56,7 @@ Retain startup logs and inspect actual source/version labels, digest, UID/GID, m
 
 When the physical SATA drive is visible, verify identity, block/SCSI pair, access, and source preservation before adding mappings. Upstream's standard optical run example uses privileged mode; evaluate that explicitly against appliance device authority before enabling it. The current dashboard configuration is not a tested optical deployment. Do not mount the GPU, Docker socket, root filesystem, or existing media libraries.
 
-Verify MakeMKV track selection. Stock `DELRAWFILES: false` does not guarantee generated rips never move, and `LOGLIFE: 0` does not fix the reviewed diagnostic/output defects. Follow [acceptance](acceptance.md); ARM completion never promotes a file.
+Verify MakeMKV track selection. The imported fixes address the reviewed logging/output defects, but must still be verified in the built image and live workflow. They require raw/completed paths on one hardlink-capable filesystem. The complete runtime configuration was staged before this source import; reconcile it with patched defaults during image acceptance. Follow [acceptance](acceptance.md); ARM completion never promotes a file.
 
 After the Docker transaction, run `/srv/b70-encode/tests/smoke/appliance` and `/srv/b70-encode/tests/smoke/vaapi-av1` with a fresh evidence output path. The latter runs a ten-second 1920x1080p30 synthetic VA-API av1_vaapi encode, probe, full decode, and checksum. Retain logs proving the hardware path, versions, and validation. Never overwrite earlier evidence.
 

@@ -1,8 +1,9 @@
 name: helix-arm
 services:
   arm:
-    # Stock upstream release 2.24.3, pinned multi-platform image manifest.
-    image: automaticrippingmachine/automatic-ripping-machine@sha256:86fe834229039a9b2715fe7d6417729c9963fcb7fd606a482d1edf7caf3b5a5d
+    # Requires a locally built, validated image containing patches/arm.
+    image: ${HELIX_ARM_IMAGE:?Build the custom Helix ARM image and set HELIX_ARM_IMAGE}
+    pull_policy: never
     platform: linux/amd64
     container_name: helix-arm
     restart: unless-stopped

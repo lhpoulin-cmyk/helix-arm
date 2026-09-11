@@ -1,5 +1,15 @@
 # Current state
 
+## 2026-09-11 — Reliability fixes imported; custom image required
+
+The operator requested merging the source fixes into Helix ARM. The complete two-commit patch series, including all 18 tests and upstream license, is now tracked under `patches/arm/`. Detailed source inventory and the original review are in `docs/source-changes.md` and `docs/source-review.md`. This supersedes the stock-image choice recorded below.
+
+Fresh replay against the pinned upstream base produced exactly the original fixed source tree `9a8c6b01166ed64f3c85fbc76822bce0e59a30b1`; all 18 tests, Python compilation, shell syntax, and whitespace checks passed. Author headers were sanitized; source hunks are unchanged. Evidence: `/srv/b70-encode/evidence/20260911-helix-arm-source-import/`.
+
+A custom Docker image containing these changes is required and has not been built. Compose now requires `HELIX_ARM_IMAGE` and uses `pull_policy: never`, preventing an implicit stock-image deployment. See `docs/custom-image.md`. No runtime, media, or encoder changes were made, so no new production encode was run for this source packaging change; the earlier pre-Docker baseline remains available and post-install regression remains pending.
+
+A fresh guest check still finds no Docker executable, an inactive Docker service, interactive sudo authentication, and only the prior USB and virtual optical drives. Login application and live acceptance remain pending. `docs/chatgpt-work-handoff.md` gives ChatGPT Work a concrete plan-design brief aimed at a working custom image/dashboard first, then the verified SATA drive and validated ripping.
+
 ## 2026-09-11 — Stock Compose deployment prepared; installation blocked
 
 The operator authorized a normal stock Docker installation and SOPS-encrypted credentials in Git. Compose pins upstream ARM 2.24.3 by digest, with a loopback dashboard and persistent local bind mounts. Dedicated home/config/log directories now exist under `/srv/b70-encode/var/helix-arm`; dedicated media/music directories exist under verified `/mnt/media/work/helix-arm`. The complete stock configuration plus ripping-only overrides is staged. See [installation](docs/deployment.md) and [storage](docs/storage.md).

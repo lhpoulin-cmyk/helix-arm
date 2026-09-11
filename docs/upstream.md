@@ -4,10 +4,10 @@ Upstream project: https://github.com/automatic-ripping-machine/automatic-ripping
 
 The existing appliance record identifies release 2.24.3 at commit `8c140c88919f2d5230dc828c56051f727eb8d50a`, with dependency submodule `3a04c4d4bed76458d09361ba4878bf72c1711f50`. These are staged provenance records, not a claim about the latest upstream release.
 
-Local branch `matrix/reliable-ingest` in `/srv/b70-encode/scratch/arm-evaluation` contains reliability changes. The patch and application instructions remain at `/srv/b70-encode/patches/arm/0001-matrix-reliable-ingest.patch` and `/srv/b70-encode/patches/arm/README.md`. This documentation repository does not vendor that source or patch.
+The complete two-commit reliability patch series and its 18 focused tests are now tracked in [patches/arm](../patches/arm/README.md), with the upstream license. Apply it to the pinned base to reproduce the source tree. [Source changes](source-changes.md) inventories all ten changed files; [historical review](source-review.md) preserves the original findings.
 
-The recorded changes cover retained logs, unique log names, combined MakeMKV diagnostics, exact nonempty output installation without replacement, propagated failures, and finite dashboard log viewing. The retained evidence at `/srv/b70-encode/evidence/20260910-arm-implementation/` reports 18 focused passing tests. Those tests do not establish full application, real-disc, browser, or GPU acceptance.
+Original commits: `06079d83d4db455dc9d04d54438cafee0892251e` and `f1ee2081352c51d90875acfdb868ea6ade54b232`. Mailbox author headers are sanitized to the repository maintainer identity; applying the patch reproduces the exact original source tree, while resulting commit IDs differ.
 
-Decision, 2026-09-11: the operator requested a boring, normal Docker deployment. Use stock upstream ARM 2.24.3, pinned by image digest in compose.yaml. This supersedes the earlier proposal to build a custom patched image. The local patches remain archived in the appliance workspace and are not applied to this deployment. Their 18 passing tests do not validate the stock image. Retain the prior review findings as live acceptance concerns; prefer upstream configuration and minimize ongoing custom maintenance.
+The latest operator instruction supersedes the earlier stock-image choice: a custom Docker image containing these patches is required. Image creation and live validation remain pending. Compose now requires an explicit custom-image reference rather than silently using stock ARM. See [custom-image work](custom-image.md).
 
-Historical appliance references: `CURRENT_STATE.md`, `docs/arm-code-review-20260910.md`, and `docs/runbooks/arm-replacement-trial.md` in `/srv/b70-encode`. Preserve these records when moving future application documentation here.
+The original appliance checkout and evidence remain preserved. No source media or running application was changed by this import.

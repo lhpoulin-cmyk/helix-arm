@@ -1,0 +1,769 @@
+From 06079d83d4db455dc9d04d54438cafee0892251e Mon Sep 17 00:00:00 2001
+From: Helix ARM Maintainers <helix-arm@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 02:51:28 +0000
+Subject: [PATCH 1/2] Preserve ingest logs and fail on unreliable output
+ installation
+
+---
+ arm/ripper/logger.py               |  61 +++-----
+ arm/ripper/main.py                 |  76 +++++-----
+ arm/ripper/makemkv.py              |  62 ++++----
+ arm/ripper/utils.py                |  22 +--
+ arm/ui/logs/templates/logview.html |  37 ++---
+ arm/ui/utils.py                    |  41 ++----
+ setup/arm.yaml                     |   4 +-
+ test/local/test_reliability.py     | 227 +++++++++++++++++++++++++++++
+ 8 files changed, 370 insertions(+), 160 deletions(-)
+ create mode 100644 test/local/test_reliability.py
+
+diff --git a/arm/ripper/logger.py b/arm/ripper/logger.py
+index 239a4b1..b90ad19 100644
+--- a/arm/ripper/logger.py
++++ b/arm/ripper/logger.py
+@@ -8,7 +8,7 @@ Also triggers CD identification
+ import os
+ import logging
+ import logging.handlers
+-import time
++import uuid
+ 
+ import arm.config.config as cfg
+ 
+@@ -38,10 +38,8 @@ def setup_job_log(job):
+     else:
+         valid_label = job.label.replace("/", "_")
+ 
+-    log_file_name = f"{valid_label}.log"
+-    new_log_file = f"{valid_label}_{job.stage}.log"
+-    temp_log_full = os.path.join(cfg.arm_config['LOGPATH'], log_file_name)
+-    log_file = new_log_file if os.path.isfile(temp_log_full) else log_file_name
++    # Persist the unique name in the job record; never reuse a disc-label log.
++    log_file = f"job-{uuid.uuid4().hex}.log"
+     log_full = os.path.join(cfg.arm_config['LOGPATH'], log_file)
+ 
+     job.logfile = log_file
+@@ -49,11 +47,14 @@ def setup_job_log(job):
+     # If a more specific log file is created, the messages are not also logged to
+     # arm.log, but they are still logged to stdout and syslog
+     logger = logging.getLogger()
+-    for handler in logger.handlers:
++    new_handler = _create_file_handler(log_file, mode="x")
++    for handler in logger.handlers[:]:
+         if isinstance(handler, logging.FileHandler):
+             logger.removeHandler(handler)
++            handler.close()
+ 
+-    logger.addHandler(_create_file_handler(log_file))
++    logger.addHandler(new_handler)
++    logging.info("Job log created: %s; disc label: %r", log_file, valid_label)
+ 
+     # These stop apprise and others spitting our secret keys if users post log online
+     logging.getLogger("apprise").setLevel(logging.WARN)
+@@ -65,37 +66,17 @@ def setup_job_log(job):
+ 
+ 
+ def clean_up_logs(logpath, loglife):
+-    """
+-    Delete all log files older than {loglife} days\n
+-    if {loglife} is 0 don't delete anything\n
+-    :param logpath: path of log files\n
+-    :param loglife: days to let logs live\n
+-    :return:
+-    """
+-    if loglife < 1:
+-        logging.info("loglife is set to 0. Removal of logs is disabled")
+-        return False
+-    now = time.time()
+-    logging.info(f"Looking for log files older than {loglife} days old.")
+-
+-    logs_folders = [logpath, os.path.join(logpath, 'progress')]
+-    # Loop through each log path
+-    for log_dir in logs_folders:
+-        logging.info(f"Checking path {log_dir} for old log files...")
+-        # Loop through each file in current folder and remove files older than set in arm.yaml
+-        if not os.path.isdir(log_dir):
+-            logging.info(f"{log_dir} is not a directory or doesn't exist. Skipping.")
+-            continue
+-        for filename in os.listdir(log_dir):
+-            fullname = os.path.join(log_dir, filename)
+-            if fullname.endswith(".log") and os.stat(fullname).st_mtime < now - loglife * 86400:
+-                logging.info(f"Deleting log file: {filename}")
+-                os.remove(fullname)
+-    return True
+-
+-
+-def _create_file_handler(filename):
+-    file_handler = logging.FileHandler(os.path.join(cfg.arm_config["LOGPATH"], filename))
++    """Retain all logs; archival is independent of job execution."""
++    # Local appliance policy: logs are evidence, including failed/active jobs.
++    # Archival is an independent operator action, never a side effect of a rip.
++    if loglife:
++        logging.warning("Automatic log deletion is disabled in this build; LOGLIFE=%s ignored", loglife)
++    return False
++
++
++def _create_file_handler(filename, mode="a"):
++    file_handler = logging.FileHandler(os.path.join(cfg.arm_config["LOGPATH"], filename),
++                                       mode=mode, encoding="utf-8", errors="backslashreplace")
+     file_handler.setFormatter(long_formatter)
+     return file_handler
+ 
+@@ -116,8 +97,8 @@ def create_early_logger(stdout=True, syslog=True, file=True):
+     # logging.getLogger("requests").setLevel(logging.ERROR)
+     # logging.getLogger("urllib3").setLevel(logging.ERROR)
+ 
+-    # create logger
+-    logger = logging.getLogger("ARM")
++    # Setup errors use root logging too. Keep their file sink attached here.
++    logger = logging.getLogger()
+     logger.setLevel(cfg.arm_config["LOGLEVEL"])
+ 
+     if file:
+diff --git a/arm/ripper/main.py b/arm/ripper/main.py
+index e013809..cee6492 100755
+--- a/arm/ripper/main.py
++++ b/arm/ripper/main.py
+@@ -136,8 +136,7 @@ def main():
+             db.session.commit()
+         else:
+             logging.critical("Music rip failed.  See previous errors.  Exiting. ")
+-            job.status = JobState.FAILURE.value
+-            db.session.commit()
++            raise utils.RipperException("Music rip failed; see job log")
+ 
+     # Type: Data
+     elif job.disctype == "data":
+@@ -145,7 +144,7 @@ def main():
+         if utils.rip_data(job):
+             utils.notify(job, constants.NOTIFY_TITLE, f"Data disc: {job.label} copying complete. ")
+         else:
+-            logging.critical("Data rip failed.  See previous errors.  Exiting.")
++            raise utils.RipperException("Data rip failed; see job log")
+ 
+     # Type: undefined
+     else:
+@@ -205,6 +204,7 @@ def setup():
+     job.status = JobState.IDLE.value
+     job.start_time = datetime.datetime.now()
+     utils.database_adder(job)
++    logging.info("Job ID: %s; log: %s", job.job_id, job.logfile)
+     # Sleep to lower chances of db locked - unlikely to be needed
+     time.sleep(1)
+     # Associate the job with the drive in the database
+@@ -234,44 +234,48 @@ def setup():
+     log_udev_params(devpath)
+ 
+ 
+-if __name__ == "__main__":
++def run_main():
++    """Keep the original error durable and return a nonzero process status."""
++    global job
+     job = None
++    exit_status = 0
+     try:
+         setup()
+         main()
++        if job is not None:
++            if job.status == JobState.FAILURE.value:
++                raise utils.RipperException("Job reported failure; see job log")
++            job.status = JobState.SUCCESS.value
+     except Exception as error:
+-        logging.critical("A fatal error has occurred and ARM is exiting.")
+-        print_stacktrace = (
+-            logging.getLogger().getEffectiveLevel() == logging.DEBUG
+-            or not isinstance(error, utils.RipperException)
+-        )
+-        logging.critical(error, exc_info=(error if print_stacktrace else None),)
+-
+-        if job:
+-            utils.notify(
+-                job,
+-                constants.NOTIFY_TITLE,
+-                f"ARM encountered a fatal error processing {job.title}. "
+-                f"Check the logs for more details. {error}"
+-            )
+-        else:
+-            utils.notify(
+-                job,
+-                constants.NOTIFY_TITLE,
+-                f"ARM encountered a fatal error during job setup."
+-                f"Check the logs for more details. {error}"
+-            )
+-        job.status = JobState.FAILURE.value
+-        job.errors = str(error)
+-        # Possibly add cleanup section here for failed job files
+-    else:
+-        job.status = JobState.SUCCESS.value
++        exit_status = 1
++        logging.exception("ARM processing failed: %s", error)
++        if job is not None:
++            job.status = JobState.FAILURE.value
++            job.errors = str(error)
++        try:
++            utils.notify(job, constants.NOTIFY_TITLE, f"ARM processing failed: {error}")
++        except Exception:
++            logging.exception("Unable to send failure notification")
+     finally:
+-        if job:
+-            job.eject()  # each job stores its eject status, so it is safe to call.
++        if job is not None:
+             job.stop_time = datetime.datetime.now()
+-            job_length = job.stop_time - job.start_time if job.start_time else 0
+-            minutes, seconds = divmod(job_length.seconds + job_length.days * 86400, 60)
+-            hours, minutes = divmod(minutes, 60)
++            duration = job.stop_time - job.start_time if job.start_time else datetime.timedelta(0)
++            total = max(0, int(duration.total_seconds()))
++            hours, remainder = divmod(total, 3600)
++            minutes, seconds = divmod(remainder, 60)
+             job.job_length = f'{hours:d}:{minutes:02d}:{seconds:02d}'
+-        db.session.commit()
++            try:
++                db.session.commit()
++            except Exception:
++                logging.exception("Unable to persist final job status")
++                exit_status = 1
++            try:
++                job.eject()
++            except Exception:
++                logging.exception("Unable to eject disc")
++                exit_status = 1
++    return exit_status
++
++
++if __name__ == "__main__":
++    sys.exit(run_main())
+diff --git a/arm/ripper/makemkv.py b/arm/ripper/makemkv.py
+index 0372bbf..94d4a5a 100644
+--- a/arm/ripper/makemkv.py
++++ b/arm/ripper/makemkv.py
+@@ -1232,40 +1232,44 @@ def run(options, select):
+         raise TypeError(options)
+     if not isinstance(select, OutputType):
+         raise TypeError(select)
+-    # Check makemkvcon path, resolves baremetal unique install issues
+     makemkvcon_path = shutil.which("makemkvcon")
+-    # robot process of makemkvcon with
+-    cmd = [
+-        makemkvcon_path,
+-        "--robot",
+-        "--messages=-stdout",
+-    ]
+-    cmd += list(options)
+-    buffer = []
+-    logging.debug(f"command: '{' '.join(cmd)}'")
+-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True) as proc:
+-        logging.debug(f"PID {proc.pid}: command: '{' '.join(cmd)}'")
+-        for line in proc.stdout:
+-            line = line.rstrip(os.linesep)
+-            logging.debug(line)  # Maybe write the raw output to a separate log
+-            if proc.returncode:
++    if makemkvcon_path is None:
++        raise FileNotFoundError("makemkvcon is not installed")
++    cmd = [makemkvcon_path, "--robot", "--messages=-stdout"] + list(options)
++    # Both streams reach the persistent job log even at the default INFO level.
++    logging.info("MakeMKV command: %s", shlex.join(cmd))
++    buffer = collections.deque(maxlen=100)
++    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                          text=True, encoding="utf-8", errors="backslashreplace") as proc:
++        try:
++            for raw_line in proc.stdout:
++                line = raw_line.rstrip("\r\n")
++                logging.info("MakeMKV: %s", line)
+                 buffer.append(line)
+-                continue
++                try:
++                    msg_type, data = parse_line(line)
++                except MakeMkvParserError:
++                    # Stderr need not follow the robot protocol; retain it above.
++                    continue
++                if msg_type in select:
++                    yield data
++            proc.wait()
++        except BaseException:
++            # A parser error/cancel must not wait indefinitely for a blocked child.
++            proc.terminate()
+             try:
+-                msg_type, data = parse_line(line)
+-            except MakeMkvParserError as err:
+-                logging.warning(err)
+-                buffer.append(line)
+-                continue
+-            logging.debug(data)
+-            if msg_type in select:
+-                yield data
++                remainder, _ = proc.communicate(timeout=10)
++            except subprocess.TimeoutExpired:
++                proc.kill()
++                remainder, _ = proc.communicate()
++            if remainder:
++                logging.info("MakeMKV remaining output: %s", remainder)
++            logging.error("MakeMKV interrupted; exit status: %s", proc.returncode)
++            raise
++    logging.info("MakeMKV exit status: %s", proc.returncode)
+     if proc.returncode:
++        logging.error("MakeMKV failed; recent output: %s", os.linesep.join(buffer))
+         raise MakeMkvRuntimeError(proc.returncode, cmd, output=os.linesep.join(buffer))
+-    if buffer and proc.returncode:
+-        logging.warning(f"Cannot parse {len(buffer)} lines: {os.linesep.join(buffer)}")
+-        raise MakeMkvRuntimeError(proc.returncode, cmd, output=os.linesep.join(buffer))
+-    logging.info("MakeMKV exits gracefully.")
+ 
+ 
+ def manual_wait(job) -> bool:
+diff --git a/arm/ripper/utils.py b/arm/ripper/utils.py
+index df33018..c4b72dd 100644
+--- a/arm/ripper/utils.py
++++ b/arm/ripper/utils.py
+@@ -320,16 +320,18 @@ def move_files_main(old_file, new_file, base_path):
+     :param str base_path: The base path of the new file - used for logging
+     :return: None
+     """
+-    if not os.path.isfile(new_file):
+-        # Try to find the file, handling minor naming discrepancies
+-        actual_old_file = find_matching_file(old_file)
+-
+-        try:
+-            shutil.move(actual_old_file, new_file)
+-        except Exception as error:
+-            logging.error(f"Unable to move '{actual_old_file}' to '{base_path}' - Error: {error}")
+-    else:
+-        logging.info(f"File: {new_file} already exists.  Not moving.")
++    # Never infer an episode's identity from a similar filename.
++    if not os.path.isfile(old_file) or os.path.islink(old_file):
++        raise RipperException(f"Expected regular output is missing: {old_file}")
++    if os.path.getsize(old_file) == 0:
++        raise RipperException(f"Output is empty: {old_file}")
++    try:
++        # Atomic no-replace installation on the trial work filesystem. A
++        # cross-filesystem move fails explicitly and retains its source.
++        os.link(old_file, new_file, follow_symlinks=False)
++        os.unlink(old_file)
++    except OSError as error:
++        raise RipperException(f"Unable to install '{old_file}' at '{new_file}': {error}") from error
+ 
+ 
+ def move_movie_poster(final_directory, hb_out_path):
+diff --git a/arm/ui/logs/templates/logview.html b/arm/ui/logs/templates/logview.html
+index 3605d10..5d64e3d 100644
+--- a/arm/ui/logs/templates/logview.html
++++ b/arm/ui/logs/templates/logview.html
+@@ -13,23 +13,26 @@
+ {% block js %}
+ {{ super() }}
+ <script>
+-    const output = document.getElementById('{{ file }}');
+-
+-    const xhr = new XMLHttpRequest();
+-    {% if mode == 'tail' or mode == 'full' %}
+-        xhr.open('GET', '/logreader?logfile={{ file }}&mode=full&json=1');
+-    {% else %}
+-        xhr.open('GET', '/logreader?logfile={{ file }}&mode={{ mode }}&json=1');
+-    {% endif %}
+-    xhr.open
+-    xhr.send();
+-
+-    setInterval(function() {
+-        output.textContent = xhr.responseText;
+-        {% if mode == 'tail' %}
+-            window.scrollTo(0, document.querySelector("#content").scrollHeight);
+-        {% endif %}
+-    }, 1000);
++    const output = document.getElementById({{ file|tojson }});
++    const mode = {{ mode|tojson }};
++    const params = new URLSearchParams({logfile: {{ file|tojson }},
++        mode: mode === 'tail' ? 'full' : mode});
++    let stopped = false;
++    window.addEventListener('pagehide', () => { stopped = true; });
++    async function refreshLog() {
++        try {
++            const response = await fetch('/logreader?' + params, {cache: 'no-store'});
++            if (!response.ok) throw new Error('HTTP ' + response.status);
++            output.textContent = await response.text();
++            document.querySelector('h4').textContent = 'Log: ' + {{ file|tojson }};
++            if (mode === 'tail') window.scrollTo(0, document.body.scrollHeight);
++        } catch (error) {
++            document.querySelector('h4').textContent = 'Unable to refresh log: ' + error.message;
++        } finally {
++            if (!stopped) setTimeout(refreshLog, 2000);
++        }
++    }
++    refreshLog();
+ 
+ </script>
+ {% endblock %}
+diff --git a/arm/ui/utils.py b/arm/ui/utils.py
+index 95b82b8..b5e4f7b 100644
+--- a/arm/ui/utils.py
++++ b/arm/ui/utils.py
+@@ -366,35 +366,24 @@ def generate_full_log(full_path):
+     :param full_path: full path to job logfile
+     :return: None
+     """
+-    try:
+-        with open(full_path) as read_log_file:
+-            while True:
+-                yield read_log_file.read()
+-                sleep(1)
+-    except IOError:
+-        try:
+-            with open(full_path, encoding="utf8", errors='ignore') as read_log_file:
+-                while True:
+-                    yield read_log_file.read()
+-                    sleep(1)
+-        except FileNotFoundError as error:
+-            raise FileNotFoundError("Not found with utf8 encoding") from error
++    with open(full_path, encoding="utf-8", errors="backslashreplace") as read_log_file:
++        while True:
++            chunk = read_log_file.read(65536)
++            if chunk:
++                yield chunk
++            else:
++                return
+ 
+ 
+ def generate_arm_cat(full_path):
+-    """
+-    Read from log file and only output ARM: logs
+-    :param full_path: full path to job logfile
+-    :return: None
+-    """
+-    read_log_file = open(full_path)
+-    while True:
+-        new = read_log_file.readline()
+-        if new:
+-            if "ARM:" in new:
+-                yield new
+-            else:
+-                sleep(1)
++    """Stream ARM lines without spinning at EOF; close on disconnect."""
++    with open(full_path, encoding="utf-8", errors="backslashreplace") as read_log_file:
++        while True:
++            line = read_log_file.readline()
++            if not line:
++                return
++            elif "ARM:" in line:
++                yield line
+ 
+ 
+ def setup_database():
+diff --git a/setup/arm.yaml b/setup/arm.yaml
+index e861778..409cd09 100755
+--- a/setup/arm.yaml
++++ b/setup/arm.yaml
+@@ -155,7 +155,7 @@ LOGLEVEL: "INFO"
+ 
+ # How long to let log files live before deleting (in days)
+ # Set to 0 to disable
+-LOGLIFE: 1
++LOGLIFE: 0
+ 
+ # Path to ARM database file
+ DBFILE: "/home/arm/db/arm.db"
+@@ -218,7 +218,7 @@ RIPMETHOD_BR: "PLACEHOLDER"
+ MKV_ARGS: ""
+ 
+ # Remove any files created in the raw and transcode paths for the job after processing is complete
+-DELRAWFILES: true
++DELRAWFILES: false
+ 
+ 
+ ##########################
+diff --git a/test/local/test_reliability.py b/test/local/test_reliability.py
+new file mode 100644
+index 0000000..92d2ffe
+--- /dev/null
++++ b/test/local/test_reliability.py
+@@ -0,0 +1,227 @@
++"""Dependency-light regression tests of upstream definitions and real subprocesses.
++
++Extract exact definitions to avoid import-time Flask/database/device startup.
++Not a substitute for container/optical acceptance. Run from checkout root:
++python3 -m unittest discover -s test/local -v
++"""
++import ast
++import collections
++import datetime
++import enum
++import logging
++import logging.handlers
++import os
++from pathlib import Path
++import shlex
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++from types import SimpleNamespace as NS
++import unittest
++from unittest.mock import Mock, patch
++import uuid
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def load(file, names, ns):
++    tree = ast.parse((ROOT / file).read_text())
++    nodes = [n for n in tree.body if getattr(n, 'name', None) in names]
++    assert len(nodes) == len(names), names
++    exec(compile(ast.Module(nodes, type_ignores=[]), str(ROOT / file), 'exec'), ns)
++    return ns
++
++
++class Reliability(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.path = Path(self.tmp.name)
++        self.cfg = NS(arm_config={'LOGPATH': str(self.path), 'LOGLEVEL': 'INFO'})
++        self.root = logging.getLogger()
++        handlers, level = self.root.handlers[:], self.root.level
++        self.root.handlers = []
++        self.root.setLevel(logging.INFO)
++        def restore():
++            for handler in self.root.handlers[:]:
++                handler.close()
++            self.root.handlers, self.root.level = handlers, level
++        self.addCleanup(restore)
++        self.logs = load('arm/ripper/logger.py', {
++            'clean_up_logs', '_create_file_handler', 'setup_job_log', 'create_early_logger',
++        }, dict(os=os, uuid=uuid, logging=logging, cfg=self.cfg,
++                long_formatter=logging.Formatter('%(message)s'),
++                short_formatter=logging.Formatter('%(message)s')))
++
++    def test_all_retention_settings_preserve_old_open_logs(self):
++        (self.path / 'progress').mkdir()
++        for name in ('failed.log', 'progress/2.log'):
++            p = self.path / name
++            p.write_text('original')
++            os.utime(p, (1, 1))
++        with (self.path / 'failed.log').open('a') as writer:
++            for retention in (0, 1, 30):
++                self.logs['clean_up_logs'](str(self.path), retention)
++            writer.write('late failure')
++        self.assertEqual((self.path / 'failed.log').read_text(), 'originallate failure')
++        self.assertEqual((self.path / 'progress/2.log').read_text(), 'original')
++
++    def test_job_logs_unique_even_same_label_and_stage(self):
++        jobs = [NS(label='DISC', stage='1', disctype='dvd') for _ in range(2)]
++        for i, job in enumerate(jobs):
++            self.logs['setup_job_log'](job)
++            logging.info('sentinel-%s', i)
++        self.assertNotEqual(jobs[0].logfile, jobs[1].logfile)
++        self.assertNotIn('sentinel-1', (self.path / jobs[0].logfile).read_text())
++        self.assertIn('sentinel-1', (self.path / jobs[1].logfile).read_text())
++
++    def test_early_root_errors_persist(self):
++        self.logs['create_early_logger'](stdout=False, syslog=False)
++        logging.error('setup failure sentinel')
++        self.assertIn('setup failure sentinel', (self.path / 'arm.log').read_text())
++
++    def test_failed_job_log_creation_keeps_startup_sink(self):
++        self.logs['create_early_logger'](stdout=False, syslog=False)
++        with patch.object(uuid, 'uuid4', return_value=NS(hex='collision')):
++            (self.path / 'job-collision.log').write_text('old evidence')
++            with self.assertRaises(FileExistsError):
++                self.logs['setup_job_log'](NS(label='disc', stage='1', disctype='dvd'))
++        logging.error('log creation failed sentinel')
++        self.assertIn('log creation failed sentinel', (self.path / 'arm.log').read_text())
++        self.assertEqual((self.path / 'job-collision.log').read_text(), 'old evidence')
++
++    def test_viewer_script_parses_with_special_filename(self):
++        from jinja2 import Environment
++        template = (ROOT / 'arm/ui/logs/templates/logview.html').read_text().split('<script>')[1].split('</script>')[0]
++        script = Environment().from_string(template).render(file="disc' &<script>.log", mode='full')
++        js = self.path / 'viewer.js'
++        js.write_text(script)
++        subprocess.run(['node', '--check', str(js)], check=True, capture_output=True)
++
++    def mover(self):
++        return load('arm/ripper/utils.py', {'RipperException', 'move_files_main'},
++                    dict(os=os, logging=logging))['move_files_main']
++
++    def test_missing_episode_does_not_move_neighbor(self):
++        neighbor = self.path / 'Episode02.mkv'
++        neighbor.write_bytes(b'episode 2')
++        with self.assertRaisesRegex(Exception, 'missing'):
++            self.mover()(str(self.path / 'Episode01.mkv'), str(self.path / 'out.mkv'), str(self.path))
++        self.assertEqual(neighbor.read_bytes(), b'episode 2')
++        self.assertFalse((self.path / 'out.mkv').exists())
++
++    def test_collision_preserves_both_files(self):
++        source, target = self.path / 'source', self.path / 'target'
++        source.write_bytes(b'new'); target.write_bytes(b'old')
++        with self.assertRaisesRegex(Exception, 'Unable to install'):
++            self.mover()(str(source), str(target), str(self.path))
++        self.assertEqual(source.read_bytes(), b'new')
++        self.assertEqual(target.read_bytes(), b'old')
++
++    def test_atomic_install_success(self):
++        source, target = self.path / 'source', self.path / 'target'
++        source.write_bytes(b'generated rip')
++        self.mover()(str(source), str(target), str(self.path))
++        self.assertFalse(source.exists())
++        self.assertEqual(target.read_bytes(), b'generated rip')
++
++    def test_link_failure_retains_source(self):
++        source = self.path / 'source'; source.write_bytes(b'rip')
++        with patch.object(os, 'link', side_effect=OSError('cross-device fixture')):
++            with self.assertRaisesRegex(Exception, 'cross-device fixture'):
++                self.mover()(str(source), str(self.path / 'out'), str(self.path))
++        self.assertEqual(source.read_bytes(), b'rip')
++
++    def test_empty_and_symlink_sources_rejected(self):
++        empty = self.path / 'empty'; empty.touch()
++        link = self.path / 'link'; link.symlink_to(empty)
++        for source in (empty, link):
++            with self.assertRaises(Exception):
++                self.mover()(str(source), str(self.path / 'out'), str(self.path))
++        self.assertTrue(empty.exists())
++
++    def test_viewers_finite_and_tolerate_invalid_bytes(self):
++        ns = load('arm/ui/utils.py', {'generate_full_log', 'generate_arm_cat'}, {})
++        path = self.path / 'view.log'
++        payload = b'ARM: first\n' + b'x' * 100000 + b'\xff\nARM: FINAL\n'
++        path.write_bytes(payload)
++        self.assertEqual(''.join(ns['generate_full_log'](path)), payload.decode('utf8', errors='backslashreplace'))
++        self.assertEqual(''.join(ns['generate_arm_cat'](path)), 'ARM: first\nARM: FINAL\n')
++
++    def run_mkv(self, body, parser=None):
++        script = self.path / 'makemkvcon'
++        script.write_text('#!' + sys.executable + '\n' + body)
++        script.chmod(0o700)
++        self.logs['setup_job_log'](NS(label='fixture', stage='1', disctype='dvd'))
++        ns = dict(shutil=NS(which=lambda _: str(script)), shlex=shlex, collections=collections,
++                  subprocess=subprocess, logging=logging, os=os, enum=enum)
++        load('arm/ripper/makemkv.py', {'OutputType', 'MakeMkvRuntimeError', 'MakeMkvParserError', 'run'}, ns)
++        ns['parse_line'] = parser or (lambda line: (ns['OutputType'].MSG, line))
++        return ns
++
++    def test_mkv_captures_both_streams_at_info(self):
++        ns = self.run_mkv("import os\nos.write(1,b'stdout sentinel\\n')\nos.write(2,b'stderr \\xff sentinel\\n')\n")
++        list(ns['run'](['mkv', 'all'], ns['OutputType'].MSG))
++        text = next(self.path.glob('job-*.log')).read_text()
++        for sentinel in ('stdout sentinel', 'stderr \\xff sentinel', 'exit status: 0', 'MakeMKV command:'):
++            self.assertIn(sentinel, text)
++
++    def test_mkv_nonzero_raises_and_retains_output(self):
++        ns = self.run_mkv("import sys\nprint('failure sentinel', flush=True)\nsys.exit(7)\n")
++        with self.assertRaises(ns['MakeMkvRuntimeError']):
++            list(ns['run']([], ns['OutputType'].MSG))
++        text = next(self.path.glob('job-*.log')).read_text()
++        self.assertIn('failure sentinel', text)
++        self.assertIn('exit status: 7', text)
++
++    def test_parser_failure_terminates_child(self):
++        def parser(_):
++            raise RuntimeError('fatal parser fixture')
++        ns = self.run_mkv("import time\nprint('trigger', flush=True)\ntime.sleep(30)\n", parser)
++        start = time.monotonic()
++        with self.assertRaisesRegex(RuntimeError, 'fatal parser fixture'):
++            list(ns['run']([], ns['OutputType'].MSG))
++        self.assertLess(time.monotonic() - start, 5)
++
++    def main_ns(self, setup, main):
++        return load('arm/ripper/main.py', {'run_main'}, dict(
++            logging=logging, datetime=datetime, setup=setup, main=main,
++            utils=NS(RipperException=RuntimeError, notify=Mock()), constants=NS(NOTIFY_TITLE='ARM'),
++            db=NS(session=NS(commit=Mock())), JobState=NS(FAILURE=NS(value='failed'), SUCCESS=NS(value='success'))))
++
++    def test_setup_failure_without_job_returns_nonzero(self):
++        ns = self.main_ns(Mock(side_effect=RuntimeError('original setup failure')), Mock())
++        ns['utils'].notify.side_effect = RuntimeError('notification failure')
++        with self.assertLogs(level='ERROR') as logs:
++            self.assertEqual(ns['run_main'](), 1)
++        self.assertTrue(any('original setup failure' in line for line in logs.output))
++        ns['main'].assert_not_called()
++
++    def test_job_failure_persisted_without_start_time(self):
++        job = NS(status='running', start_time=None, eject=Mock())
++        ns = self.main_ns(lambda: ns.update(job=job), Mock(side_effect=RuntimeError('move failed')))
++        with self.assertLogs(level='ERROR'):
++            self.assertEqual(ns['run_main'](), 1)
++        self.assertEqual(job.status, 'failed')
++        self.assertEqual(job.errors, 'move failed')
++        self.assertEqual(job.job_length, '0:00:00')
++        ns['db'].session.commit.assert_called_once()
++
++    def test_existing_failure_not_overwritten_with_success(self):
++        job = NS(status='failed', start_time=None, eject=Mock())
++        ns = self.main_ns(lambda: ns.update(job=job), Mock())
++        with self.assertLogs(level='ERROR'):
++            self.assertEqual(ns['run_main'](), 1)
++        self.assertEqual(job.status, 'failed')
++
++    def test_success_returns_zero(self):
++        job = NS(status='running', start_time=datetime.datetime.now(), eject=Mock())
++        ns = self.main_ns(lambda: ns.update(job=job), Mock())
++        self.assertEqual(ns['run_main'](), 0)
++        self.assertEqual(job.status, 'success')
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.53.0
+
+
+From f1ee2081352c51d90875acfdb868ea6ade54b232 Mon Sep 17 00:00:00 2001
+From: Helix ARM Maintainers <helix-arm@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 02:51:49 +0000
+Subject: [PATCH 2/2] Preserve wrapper failure status and clarify retention
+ policy
+
+---
+ arm/ui/comments.json                 | 2 +-
+ scripts/docker/docker_arm_wrapper.sh | 5 ++++-
+ setup/arm.yaml                       | 4 ++--
+ 3 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/arm/ui/comments.json b/arm/ui/comments.json
+index 946a9d4..bcf3286 100644
+--- a/arm/ui/comments.json
++++ b/arm/ui/comments.json
+@@ -41,7 +41,7 @@
+   "INSTALLPATH": "# Path to installation of ARM ",
+   "LOGPATH": "# Path to directory to hold log files\n# Make sure to include trailing /",
+   "LOGLEVEL": "# Log level.  DEBUG, INFO, WARNING, ERROR, CRITICAL\n# The default is INFO\n# If you are experiencing difficulties set this to DEBUG",
+-  "LOGLIFE": "# How long to let log files live before deleting (in days)\n# Set to 0 to disable",
++  "LOGLIFE": "# Automatic deletion is disabled in the Matrix build, regardless of this value.\n# Retained for configuration compatibility; archive logs separately.",
+   "DBFILE": "# Path to ARM database file",
+   "WEBSERVER_IP": "# IP address of web server (this machine)\n# Use x.x.x.x to autodetect the IP address to use",
+   "WEBSERVER_PORT": "# Port for web server",
+diff --git a/scripts/docker/docker_arm_wrapper.sh b/scripts/docker/docker_arm_wrapper.sh
+index 4bee20d..61d90c1 100755
+--- a/scripts/docker/docker_arm_wrapper.sh
++++ b/scripts/docker/docker_arm_wrapper.sh
+@@ -1,5 +1,8 @@
+ #!/bin/bash
+ 
++# Preserve a failed ripper exit status through the logging pipeline.
++set -o pipefail
++
+ DEVNAME=$1
+ ARMLOG="/home/arm/logs/arm.log"
+ echo "[ARM] Entering docker wrapper" | logger -t ARM -s
+@@ -33,4 +36,4 @@ else
+ 	  echo "$(date) [ARM] Starting ARM for unknown disc type on ${DEVNAME}" >> $ARMLOG
+ fi
+ cd /home/arm
+-python3 /opt/arm/arm/ripper/main.py -d "${DEVNAME}" | logger -t ARM -s
++python3 /opt/arm/arm/ripper/main.py -d "${DEVNAME}" 2>&1 | logger -t ARM -s
+diff --git a/setup/arm.yaml b/setup/arm.yaml
+index 409cd09..edf4409 100755
+--- a/setup/arm.yaml
++++ b/setup/arm.yaml
+@@ -153,8 +153,8 @@ LOGPATH: "/home/arm/logs/"
+ # If you are experiencing difficulties set this to DEBUG
+ LOGLEVEL: "INFO"
+ 
+-# How long to let log files live before deleting (in days)
+-# Set to 0 to disable
++# Automatic deletion is disabled in the Matrix build, regardless of this value.
++# Retained for configuration compatibility; archive logs separately.
+ LOGLIFE: 0
+ 
+ # Path to ARM database file
+-- 
+2.53.0
+

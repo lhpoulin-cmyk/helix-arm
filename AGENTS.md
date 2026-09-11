@@ -1,6 +1,6 @@
 # Helix ARM repository instructions
 
-Maintain documentation and sanitized example configuration for the ARM media-ingestion application. Prefer upstream software and configuration over custom development. The operator authorized a standard stock ARM Docker deployment on 2026-09-11 and SOPS-encrypted login YAML in this repository. This does not authorize host changes or deletion of media.
+Maintain documentation and sanitized example configuration for the ARM media-ingestion application. Prefer upstream software and configuration over custom development. The operator authorized ARM Docker deployment and SOPS-encrypted login YAML, then explicitly requested importing the reliability fixes and a required custom Docker image. Keep the complete patch series reproducible against the pinned upstream base; stock images do not include these fixes. This does not authorize host changes or deletion of media.
 
 Before implementation or diagnostics on an appliance, read its AGENTS.md and active hardware profile and verify observed state. Keep source media immutable. Verify exact external mounts and capacity before access or substantial writes. Keep ARM ripping-only until explicitly changed; encoding and validated promotion are separate steps.
 
