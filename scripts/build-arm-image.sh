@@ -18,7 +18,7 @@ if [[ "${base_image}" != automaticrippingmachine/arm-dependencies@sha256:* ]]; t
 fi
 
 actual_tree="$(git -C "${source_dir}" rev-parse 'HEAD^{tree}')"
-if [[ "${actual_tree}" != "${EXPECTEDED_TREE:-$EXPECTED_TREE}" ]]; then
+if [[ "${actual_tree}" != "${EXPECTED_TREE}" ]]; then
   printf 'Refusing unverified source tree: %s\n' "${actual_tree}" >&2
   exit 1
 fi
