@@ -1,0 +1,3 @@
+# Mailbox patches contain significant diff context prefixes and signature spaces.
+# Validate whitespace on the applied source instead of altering patch payloads.
+patches/arm/*.patch -whitespace
