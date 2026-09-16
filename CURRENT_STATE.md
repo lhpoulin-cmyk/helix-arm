@@ -1,5 +1,20 @@
 # Current state
 
+## 2026-09-16 — Movie-selection source repair verified, not deployed
+
+A small MakeMKV selector supports explicit attribute49 identification, opt-in
+chapter/size heuristics, and manual title IDs bound to an ARM job and inventory.
+Default fallback is existing operator selection; series routing is unchanged.
+The sanitized 139-title regression selects title32 / playlist00609.mpls via the
+unique FPL_MainFeature attribute; legacy heuristics select128. This is retained
+inventory evidence, not fresh disc binding or successful extraction.
+
+Independent replay passed33 product tests and38 B70 application-source tests,
+including15 focused policy/parser/routing regressions. No rip, runtime update,
+image build or privilege change occurred. B70 workload pins remain with arm-cp;
+source publication does not install this repair. See [movie selection](docs/movie-selection.md)
+for configuration, limitations and rollback. Older entries below are historical.
+
 ## 2026-09-11 — Reliability fixes imported; custom image required
 
 The operator requested merging the source fixes into Helix ARM. The complete two-commit patch series, including all 18 tests and upstream license, is now tracked under `patches/arm/`. Detailed source inventory and the original review are in `docs/source-changes.md` and `docs/source-review.md`. This supersedes the stock-image choice recorded below.

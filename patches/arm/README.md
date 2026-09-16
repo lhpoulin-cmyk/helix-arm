@@ -21,3 +21,13 @@ Original source commits are recorded in [upstream notes](../../docs/upstream.md)
 Fresh replay on 2026-09-11 produced the exact expected tree; 18 tests, Python compilation, shell syntax, and patch whitespace checks passed. Raw evidence remains outside Git at `/srv/b70-encode/evidence/20260911-helix-arm-source-import/`.
 
 See [source inventory](../../docs/source-changes.md) for behavior and constraints. A [custom image](../../docs/custom-image.md) must be created before deployment. Rollback is to leave this checkout unused or restore a previously validated image/configuration/database together, retaining all media and logs. Stock ARM is a diagnostic baseline, not an equivalent replacement for these fixes.
+
+## Movie selection addition — 2026-09-16
+
+Apply `0002-movie-selection.patch` after the reliability mailbox above.
+The resulting product tree is `36618c9b366a5387a2876509c0063b53383120af`
+(33 focused tests). For B70's additional application-secret base, the result is
+`2d15943e4119d4573e521b8d8518500b79a978da` (38 tests).
+See [policy and configuration](../../docs/movie-selection.md) and
+[machine-readable pins](movie-selection.json). No image was built or deployed.
+The previous tree above remains the historical reliability-only baseline.

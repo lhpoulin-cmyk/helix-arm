@@ -1,5 +1,9 @@
 # Helix ARM
 
+**2026-09-16:** [Movie-selection repair](docs/movie-selection.md) implemented and
+verified as a reproducible product patch; not deployed. Older deployment status
+below is historical; current B70 runtime authority is arm-cp.
+
 Helix ARM documents our Automatic Ripping Machine (ARM) media-ingestion application: reproducible disc ripping, retained diagnostics, output validation, and handoff to a separate hardware-encoding pipeline.
 
 This repository holds application documentation, the complete reliability patch series with its tests, a Compose configuration requiring a custom image, and SOPS-encrypted login credentials. Runtime directories and ripping-only configuration are prepared; Docker installation and live acceptance are blocked on guest sudo authentication. The application builds on upstream ARM, not a newly implemented ripper.

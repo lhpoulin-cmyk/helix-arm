@@ -1,0 +1,701 @@
+From d519a0566c3f822554d521d2022263c8976052bb Mon Sep 17 00:00:00 2001
+From: Helix ARM <helix-arm@localhost>
+Date: Wed, 16 Sep 2026 22:11:20 +0000
+Subject: [PATCH] Select MakeMKV movies with explicit scoped policy and manual
+ fallback
+
+---
+ arm/ripper/makemkv.py              |  65 +++++++++-
+ arm/ripper/movie_selection.py      |  57 ++++++++
+ arm/ui/comments.json               |   6 +
+ arm_wiki/Movie-selection.md        |  70 ++++++++++
+ setup/arm.yaml                     |  10 ++
+ test/local/fixtures/movie-139.json | 146 +++++++++++++++++++++
+ test/local/test_movie_selection.py | 200 +++++++++++++++++++++++++++++
+ 7 files changed, 551 insertions(+), 3 deletions(-)
+ create mode 100644 arm/ripper/movie_selection.py
+ create mode 100644 arm_wiki/Movie-selection.md
+ create mode 100644 test/local/fixtures/movie-139.json
+ create mode 100644 test/local/test_movie_selection.py
+
+diff --git a/arm/ripper/makemkv.py b/arm/ripper/makemkv.py
+index 7faa909..280d09b 100644
+--- a/arm/ripper/makemkv.py
++++ b/arm/ripper/makemkv.py
+@@ -11,6 +11,7 @@ import collections
+ import dataclasses
+ import enum
+ import itertools
++import json
+ import logging
+ import os
+ import re
+@@ -23,6 +24,7 @@ import arm.config.config as cfg
+ from arm.models import SystemDrives, Track
+ from arm.models.job import JobState
+ from arm.ripper import utils
++from arm.ripper.movie_selection import select_movie
+ from arm.ripper.utils import notify
+ from arm.ui import db
+ 
+@@ -186,6 +188,8 @@ class TrackID(enum.IntEnum):
+     DURATION = 9
+     FILESIZE = 11
+     FILENAME = 27
++    SOURCE_FILE = 16
++    PLAYLIST_TYPE = 49
+ 
+ 
+ @dataclasses.dataclass
+@@ -666,8 +670,47 @@ def makemkv_mkv(job, rawpath):
+     mode = utils.get_drive_mode(job.devpath)
+     logging.info(f"Job running in {mode} mode")
+     # Get track info form mkv rip
+-    get_track_info(job.drive.mdisc, job)
+-    # route to ripping functions.
++    inventory = get_track_info(job.drive.mdisc, job)
++    # Movies use one explicit policy; series keep the existing selection path.
++    if job.video_type != 'series':
++        if (not inventory or {r['title_id'] for r in inventory} != set(range(job.no_of_titles))
++                or len(inventory) != job.no_of_titles):
++            raise utils.RipperException("Movie selection requires a complete title inventory")
++        policy = dict(cfg.arm_config)
++        if mode == 'manual':
++            policy['MOVIE_SELECTION_STRATEGY'] = 'manual'
++        decision = select_movie(inventory, policy, job.job_id, job.video_type)
++        logging.info("MOVIE_SELECTION %s", json.dumps(decision, sort_keys=True))
++        if decision['title_id'] is None:
++            # Existing ARM UI supplies attempt-local choices. Never inherit a
++            # previous start signal or the automatically populated track flags.
++            job.manual_start = False
++            for track in job.tracks:
++                track.process = False
++            job.status = JobState.VIDEO_WAITING.value
++            db.session.commit()
++            if not manual_wait(job):
++                raise utils.RipperException("Movie selection requires operator input; no title ripped")
++            db.session.expire_all()
++            selected = [track for track in job.tracks if track.process]
++            ids = {row['title_id'] for row in inventory}
++            if len(selected) != 1 or int(selected[0].track_number) not in ids:
++                raise utils.RipperException("Movie selection requires exactly one current title")
++            track = selected[0]
++            decision.update(policy='manual', title_id=int(track.track_number),
++                            reason='OPERATOR_SELECTED_CURRENT_JOB')
++            logging.info("MOVIE_SELECTION %s", json.dumps(decision, sort_keys=True))
++        else:
++            selected = [track for track in job.tracks
++                        if int(track.track_number) == decision['title_id']]
++            if len(selected) != 1:
++                raise utils.RipperException("Movie selection track binding mismatch")
++            track = selected[0]
++        job.status = JobState.VIDEO_RIPPING.value
++        db.session.commit()
++        rip_mainfeature(job, track, rawpath)
++        return
++    # Existing TV routing, including manual mode and length filters, unchanged.
+     if job.config.MAINFEATURE:
+         logging.info("Trying to find mainfeature (sorting by chapters desc, filesize desc, track_number asc)")
+         track = Track.query.filter_by(job_id=job.job_id).order_by(
+@@ -947,6 +990,7 @@ class TrackInfoProcessor:
+     def __init__(self, job, index):
+         self.job = job
+         self.index = index
++        self.inventory = []
+ 
+         # Initialize track-related state variables
+         self.track_id = None
+@@ -954,6 +998,8 @@ class TrackInfoProcessor:
+         self.aspect = ""
+         self.fps = 0.0
+         self.filename = ""
++        self.source_file = ""
++        self.playlist_types = set()
+         self.stream_type = None
+         self.chapters = 0
+         self.filesize = 0
+@@ -1005,6 +1051,10 @@ class TrackInfoProcessor:
+         if message.id == TrackID.FILENAME:
+             # Extract filename between quotes
+             self.filename = next(iter(message.value.split('"')[1::2]), message.value)
++        elif message.id == TrackID.SOURCE_FILE:
++            self.source_file = message.value.strip()
++        elif message.id == TrackID.PLAYLIST_TYPE:
++            self.playlist_types.add(message.value.strip())
+         elif message.id == TrackID.DURATION:
+             self.seconds = convert_to_seconds(message.value.strip())
+         elif message.id == TrackID.CHAPTERS:
+@@ -1019,13 +1069,19 @@ class TrackInfoProcessor:
+     def _add_track(self):
+         if self.track_id is None:
+             return
++        main_feature = 'FPL_MainFeature' in self.playlist_types
++        self.inventory.append(dict(title_id=int(self.track_id), duration_seconds=self.seconds,
++                                   chapters=self.chapters, size_bytes=self.filesize,
++                                   filename=self.filename, source_file=self.source_file,
++                                   main_feature=main_feature,
++                                   identification_conflict=len(self.playlist_types) > 1))
+         utils.put_track(
+             self.job,
+             self.track_id,
+             self.seconds,
+             self.aspect,
+             str(self.fps),
+-            False,
++            main_feature,
+             SOURCE,
+             self.filename,
+             self.chapters,
+@@ -1036,6 +1092,8 @@ class TrackInfoProcessor:
+         self.aspect = ""
+         self.fps = 0.0
+         self.filename = ""
++        self.source_file = ""
++        self.playlist_types = set()
+         self.chapters = 0
+         self.filesize = 0
+ 
+@@ -1055,6 +1113,7 @@ def get_track_info(index, job):
+     """
+     processor = TrackInfoProcessor(job, index)
+     processor.process_messages()
++    return processor.inventory
+ 
+ 
+ def convert_to_seconds(hms_value):
+diff --git a/arm/ripper/movie_selection.py b/arm/ripper/movie_selection.py
+new file mode 100644
+index 0000000..067b7c7
+--- /dev/null
++++ b/arm/ripper/movie_selection.py
+@@ -0,0 +1,57 @@
++"""Pure MakeMKV movie policy. Parsing, database access and ripping live elsewhere."""
++import hashlib
++import json
++
++
++def select_movie(titles, config, job_id, video_type='movie'):
++    """Return a logged decision or operator choices; never read a disc or rip.
++
++    Manual YAML choices bind both the ARM job ID and the exact normalized title
++    inventory. The fingerprint is an inventory binding, not a physical disc ID.
++    """
++    rows = sorted(titles, key=lambda row: row['title_id'])
++    fingerprint = hashlib.sha256(json.dumps(rows, sort_keys=True,
++                                            separators=(',', ':')).encode()).hexdigest()
++    strategy = config.get('MOVIE_SELECTION_STRATEGY', 'explicit')
++    fallback = config.get('MOVIE_SELECTION_FALLBACK', 'manual')
++    result = dict(strategy=strategy, fallback=fallback, job_id=job_id,
++                  inventory_sha256=fingerprint, policy=None, title_id=None,
++                  reason=None, candidates=rows)
++
++    def decision(policy, reason, title=None):
++        result.update(policy=policy, reason=reason,
++                      title_id=None if title is None else title['title_id'])
++        return result
++
++    if strategy not in ('explicit', 'heuristic', 'manual') or fallback not in ('manual', 'heuristic'):
++        return decision('operator', 'INVALID_POLICY')
++    if not rows or len({r['title_id'] for r in rows}) != len(rows):
++        return decision('operator', 'INVALID_INVENTORY')
++    if video_type != 'movie':
++        return decision('operator', 'MOVIE_CLASSIFICATION_REQUIRED')
++
++    explicit = [row for row in rows if row['main_feature']]
++    reason = ('EXPLICIT_AMBIGUOUS' if explicit or any(r['identification_conflict'] for r in rows)
++              else 'EXPLICIT_UNAVAILABLE')
++    if strategy == 'explicit':
++        if len(explicit) == 1 and not any(r['identification_conflict'] for r in rows):
++            return decision('explicit', 'UNIQUE_TINFO_49_FPL_MAINFEATURE', explicit[0])
++        strategy = fallback
++    if strategy == 'heuristic':
++        # Preserve upstream order: chapters DESC, bytes DESC, title number ASC.
++        title = min(rows, key=lambda r: (-r['chapters'], -r['size_bytes'], r['title_id']))
++        return decision('heuristic', reason + '_FALLBACK' if result['strategy'] == 'explicit'
++                        else 'CHAPTERS_SIZE_TITLE_ID', title)
++
++    manual_job = config.get('MOVIE_SELECTION_MANUAL_JOB_ID', -1)
++    manual_inventory = config.get('MOVIE_SELECTION_MANUAL_INVENTORY_SHA256', '')
++    manual_title = config.get('MOVIE_SELECTION_MANUAL_TITLE_ID', -1)
++    if (type(manual_job) is int and manual_job == job_id and manual_inventory == fingerprint
++            and type(manual_title) is int):
++        matches = [r for r in rows if r['title_id'] == manual_title]
++        if len(matches) == 1:
++            return decision('manual', 'JOB_AND_INVENTORY_BOUND_OVERRIDE', matches[0])
++        return decision('operator', 'MANUAL_TITLE_NOT_FOUND')
++    if manual_job != -1 or manual_inventory or manual_title != -1:
++        return decision('operator', 'MANUAL_SCOPE_MISMATCH')
++    return decision('operator', reason if result['strategy'] == 'explicit' else 'MANUAL_REQUESTED')
+diff --git a/arm/ui/comments.json b/arm/ui/comments.json
+index bcf3286..5009ca8 100644
+--- a/arm/ui/comments.json
++++ b/arm/ui/comments.json
+@@ -1,4 +1,10 @@
+ {
++    "MOVIE_SELECTION_STRATEGY": "# MakeMKV movie policy: explicit, heuristic, manual. See arm_wiki/Movie-selection.md.",
++    "MOVIE_SELECTION_FALLBACK": "# When explicit identification is absent or ambiguous: manual (default) or heuristic.",
++    "MOVIE_SELECTION_MANUAL_JOB_ID": "# Manual override requires this exact current job ID; -1 is unset.",
++    "MOVIE_SELECTION_MANUAL_INVENTORY_SHA256": "# Manual override also requires the current MOVIE_SELECTION inventory hash.",
++    "MOVIE_SELECTION_MANUAL_TITLE_ID": "# Exact source title ID for the bound job/inventory; -1 is unset.",
++
+   "ARM_CFG_GROUPS": {
+     "BEGIN": "# ARM (Automatic Ripping Machine) config file\n\n#################\n## ARM Options ##\n#################",
+     "DIR_SETUP": "#####################\n## Directory setup ##\n#####################",
+diff --git a/arm_wiki/Movie-selection.md b/arm_wiki/Movie-selection.md
+new file mode 100644
+index 0000000..31526a2
+--- /dev/null
++++ b/arm_wiki/Movie-selection.md
+@@ -0,0 +1,70 @@
++# MakeMKV movie selection
++
++For MakeMKV title extraction (`RIPMETHOD: mkv`, also DVD extraction), non-series
++jobs pass through `arm/ripper/movie_selection.py`. The selector is pure: it takes
++the parsed inventory, YAML policy, job ID and video type and returns a decision.
++It never opens a disc. `TrackInfoProcessor` separately parses the inventory.
++
++## Configuration in arm.yaml
++
++Use the existing flat uppercase YAML configuration keys:
++
++```yaml
++MOVIE_SELECTION_STRATEGY: explicit
++MOVIE_SELECTION_FALLBACK: manual
++MOVIE_SELECTION_MANUAL_JOB_ID: -1
++MOVIE_SELECTION_MANUAL_INVENTORY_SHA256: ""
++MOVIE_SELECTION_MANUAL_TITLE_ID: -1
++```
++
++- `explicit` prefers exactly one MakeMKV `TINFO:<id>,49,0,"FPL_MainFeature"`
++  attribute. Filenames, title names, duration, size and chapter count do not
++  establish explicit identification. Conflicting attribute values or multiple
++  marked titles invoke the fallback.
++- `heuristic` opts into the old ARM order: chapter count descending, byte size
++  descending, then numeric source title ID ascending. This is a heuristic, not
++  verified identification. It can be selected directly or as the fallback.
++- `manual` accepts an exact title ID only when BOTH the configured ARM job ID
++  and inventory SHA-256 match the current attempt. Set all three override keys
++  using a current `MOVIE_SELECTION` log entry. A stale or partial override
++  requires operator input and cannot silently select on the next job/disc.
++  Zero is a valid title ID; -1 means unset. The inventory hash binds normalized
++  parser records, not a physical disc identity or historical provenance claim.
++
++Fallback supports `manual` (default) or an explicitly opted-in `heuristic`.
++With no valid manual override, ARM clears stale selections/start flags and uses
++its existing waiting state and track-selection UI. Choose exactly one current
++track and start that job within the existing 30-minute wait. Missing/multiple
++choices or timeout stop before ripping; there is no silent heuristic fallback.
++An explicit drive manual mode selects the manual strategy. Invalid policies,
++incomplete inventories, and unknown video type cannot automatically select.
++Unknown video type requires current-job operator selection or corrected movie
++classification; an explicit playlist marker alone does not classify the disc.
++
++Policy is loaded from the normal per-process `arm.yaml` (`ARM_CONFIG_FILE` when
++set); start a new job with the intended snapshot. These keys require no database
++migration and are not new web configuration controls. Every decision logs
++`MOVIE_SELECTION` JSON with configured strategy/fallback, actual policy, reason,
++job ID, inventory hash, title ID and candidates. Logs are private evidence and
++may contain filenames. Waiting and final operator decisions are both recorded.
++
++For MakeMKV movies this policy replaces the `MAINFEATURE` chapter/size shortcut,
++including when `MAINFEATURE` is false. Changing `MAINFEATURE` alone is not this
++repair. Existing series routing (auto/manual, length filters and existing
++MAINFEATURE behavior) is unchanged. TV episodes and short titles are not mapped
++or pruned by this selector. Blu-ray backup and HandBrake paths are unchanged.
++
++## Verification and limits
++
++`python3 -B -m unittest discover -s test/local -v` includes the pinned parser,
++selector and routing tests without importing a live app or starting a rip.
++The sanitized 139-title fixture uses all durations from a retained diagnostic
++and matching attribute records from the earlier ARM job log. Its movie name is
++replaced with MOVIE; it contains no raw logs or appliance identity. Attribute49
++marks title32 alone: playlist00609.mpls,6161seconds,16chapters,27350710272bytes.
++The legacy heuristic selects title128. This proves policy behavior on retained
++evidence, not a fresh optical binding or actual extraction success.
++
++Deploy only through the workload owner's reviewed source/image release. No
++runtime changes, disc reads or rip acceptance accompany source tests. Restore
++the previous matched image/configuration to roll back; retain all logs/media.
+diff --git a/setup/arm.yaml b/setup/arm.yaml
+index edf4409..e23a6c9 100755
+--- a/setup/arm.yaml
++++ b/setup/arm.yaml
+@@ -249,6 +249,16 @@ HANDBRAKE_LOCAL: HandBrakeCLI
+ # However, it does not handle tv shows well at all.  This setting is only used when the video is identified as a movie.
+ MAINFEATURE: false
+ 
++# MakeMKV movie title selection (RIPMETHOD=mkv); independent of MAINFEATURE.
++# See arm_wiki/Movie-selection.md. TV routing remains unchanged.
++MOVIE_SELECTION_STRATEGY: explicit  # explicit | heuristic | manual
++MOVIE_SELECTION_FALLBACK: manual   # manual | heuristic
++# Optional manual override: ALL three values must match the current attempt.
++# Use the job ID and inventory hash reported in MOVIE_SELECTION; no global title.
++MOVIE_SELECTION_MANUAL_JOB_ID: -1
++MOVIE_SELECTION_MANUAL_INVENTORY_SHA256: ""
++MOVIE_SELECTION_MANUAL_TITLE_ID: -1
++
+ # Additional HandBrake arguments for DVDs.
+ HB_ARGS_DVD: "--subtitle scan -F"
+ 
+diff --git a/test/local/fixtures/movie-139.json b/test/local/fixtures/movie-139.json
+new file mode 100644
+index 0000000..f43c3c7
+--- /dev/null
++++ b/test/local/fixtures/movie-139.json
+@@ -0,0 +1,146 @@
++{
++  "classification": "SANITIZED_REGRESSION_FIXTURE_NOT_FRESH_DISC_BINDING",
++  "provenance": "139 durations from retained 2026-09-16 diagnostic; attributes 8/11/16/27/49 from retained 2026-09-15 ARM job log. All durations match by source index. Movie name replaced with MOVIE.",
++  "title_count": 139,
++  "titles": [
++    {"title_id":0,"attributes":{"8":"1","9":"0:00:05","11":"1222656","16":"00002.mpls","27":"MOVIE-Interpol Warning_t00.mkv","49":"Interpol Warning"}},
++    {"title_id":1,"attributes":{"8":"2","9":"0:01:49","11":"287723520","16":"00003.mpls","27":"MOVIE-TMPL Main Menu_t01.mkv","49":"TMPL Main Menu"}},
++    {"title_id":2,"attributes":{"8":"1","9":"0:00:10","11":"22437888","16":"00004.mpls","27":"MOVIE-FBI_Warning_t02.mkv","49":"FBI_Warning"}},
++    {"title_id":3,"attributes":{"8":"1","9":"0:00:11","11":"6365184","16":"00011.mpls","27":"MOVIE-VAM Disclaimer_t03.mkv","49":"VAM Disclaimer"}},
++    {"title_id":4,"attributes":{"8":"1","9":"0:00:05","11":"675840","16":"00012.mpls","27":"MOVIE-LGELive Disclaimer_t04.mkv","49":"LGELive Disclaimer"}},
++    {"title_id":5,"attributes":{"8":"1","9":"0:00:05","11":"804864","16":"00018.mpls","27":"MOVIE-Error Region Code_t05.mkv","49":"Error Region Code"}},
++    {"title_id":6,"attributes":{"8":"1","9":"0:00:14","11":"47087616","16":"00019.mpls","27":"MOVIE-DTS_Logo_51_t06.mkv","49":"DTS_Logo_51"}},
++    {"title_id":7,"attributes":{"8":"1","9":"0:00:22","11":"72923136","16":"00020.mpls","27":"MOVIE-Hero_Logo_US_t07.mkv","49":"Hero_Logo_US"}},
++    {"title_id":8,"attributes":{"8":"1","9":"0:01:59","11":"370262016","16":"00021.mpls","27":"MOVIE-dts_check_71_t08.mkv","49":"dts_check_71"}},
++    {"title_id":9,"attributes":{"8":"1","9":"0:00:14","11":"50927616","16":"00022.mpls","27":"MOVIE-DTS logo_t09.mkv","49":"DTS logo"}},
++    {"title_id":10,"attributes":{"8":"1","9":"0:00:22","11":"69838848","16":"00027.mpls","27":"MOVIE-Horror_Logo_US_t10.mkv","49":"Horror_Logo_US"}},
++    {"title_id":11,"attributes":{"8":"1","9":"0:03:25","11":"867446784","16":"00029.mpls","27":"MOVIE-dts_check_51_t11.mkv","49":"dts_check_51"}},
++    {"title_id":12,"attributes":{"8":"1","9":"0:00:11","11":"780288","16":"00041.mpls","27":"MOVIE-VAM Disclaimer_UK_t12.mkv","49":"VAM Disclaimer_UK"}},
++    {"title_id":13,"attributes":{"8":"1","9":"0:00:05","11":"1222656","16":"00042.mpls","27":"MOVIE-Interpol Warning_UK_t13.mkv","49":"Interpol Warning_UK"}},
++    {"title_id":14,"attributes":{"8":"1","9":"0:00:22","11":"64739328","16":"00045.mpls","27":"MOVIE-Studio_Canal_Logo_UK_t14.mkv","49":"Studio_Canal_Logo_UK"}},
++    {"title_id":15,"attributes":{"8":"1","9":"0:00:16","11":"37969920","16":"00079.mpls","27":"MOVIE-ALLIANCE_Bi_Interpol_t15.mkv","49":"ALLIANCE_Bi_Interpol"}},
++    {"title_id":16,"attributes":{"8":"1","9":"0:00:19","11":"47812608","16":"00081.mpls","27":"MOVIE-ALLIANCE_Logo_t16.mkv","49":"ALLIANCE_Logo"}},
++    {"title_id":17,"attributes":{"8":"1","9":"0:00:05","11":"3846144","16":"00082.mpls","27":"MOVIE-ALLIANCE_Disclaimer_t17.mkv","49":"ALLIANCE_Disclaimer"}},
++    {"title_id":18,"attributes":{"8":"1","9":"0:00:05","11":"5136384","16":"00083.mpls","27":"MOVIE-ALLIANCE_Copyright_t18.mkv","49":"ALLIANCE_Copyright"}},
++    {"title_id":19,"attributes":{"8":"1","9":"0:00:07","11":"946176","16":"00084.mpls","27":"MOVIE-ALLIANCE_2004_Disclaimer_t19.mkv","49":"ALLIANCE_2004_Disclaimer"}},
++    {"title_id":20,"attributes":{"8":"1","9":"0:00:58","11":"154060800","16":"00114.mpls","27":"MOVIE-TMPL Splash_t20.mkv","49":"TMPL Splash"}},
++    {"title_id":21,"attributes":{"8":"1","9":"0:00:50","11":"133662720","16":"00115.mpls","27":"MOVIE-TMPL Loop_t21.mkv","49":"TMPL Loop"}},
++    {"title_id":22,"attributes":{"8":"1","9":"0:00:05","11":"976896","16":"00200.mpls","27":"MOVIE-Error Region Code Generic_t22.mkv","49":"Error Region Code Generic"}},
++    {"title_id":23,"attributes":{"8":"1","9":"0:01:36","11":"229361664","16":"00450.mpls","27":"MOVIE-SEG Trailer 1_t23.mkv","49":"SEG Trailer 1"}},
++    {"title_id":24,"attributes":{"8":"6","9":"0:09:56","11":"1424209920","16":"00451.mpls","27":"MOVIE-SF_also_from_lge_0_t24.mkv","49":"SF_also_from_lge_0"}},
++    {"title_id":25,"attributes":{"8":"1","9":"0:21:19","11":"3718625280","16":"00452.mpls","27":"MOVIE-SF_Gods_t25.mkv","49":"SF_Gods"}},
++    {"title_id":26,"attributes":{"8":"1","9":"0:24:59","11":"4360476672","16":"00453.mpls","27":"MOVIE-SF_Big_t26.mkv","49":"SF_Big"}},
++    {"title_id":27,"attributes":{"8":"1","9":"0:13:36","11":"2374526976","16":"00454.mpls","27":"MOVIE-SF_Assault_t27.mkv","49":"SF_Assault"}},
++    {"title_id":28,"attributes":{"8":"1","9":"0:24:19","11":"4244606976","16":"00455.mpls","27":"MOVIE-SF_Guns_t28.mkv","49":"SF_Guns"}},
++    {"title_id":29,"attributes":{"8":"5","9":"0:04:39","11":"812580864","16":"00456.mpls","27":"MOVIE-SF_DS_t29.mkv","49":"SF_DS"}},
++    {"title_id":30,"attributes":{"8":"1","9":"0:05:09","11":"899555328","16":"00457.mpls","27":"MOVIE-SF_Gag_t30.mkv","49":"SF_Gag"}},
++    {"title_id":31,"attributes":{"8":"1","9":"1:43:42","11":"27433893888","16":"00594.mpls","27":"MOVIE-SPBD Copy Disclaimer Playlist_t31.mkv","49":"SPBD Copy Disclaimer Playlist"}},
++    {"title_id":32,"attributes":{"8":"16","9":"1:42:41","11":"27350710272","16":"00609.mpls","27":"MOVIE-FPL_MainFeature_t32.mkv","49":"FPL_MainFeature"}},
++    {"title_id":33,"attributes":{"8":"1","9":"0:02:35","11":"370262016","16":"00701.mpls","27":"MOVIE-SEG Trailer 2_t33.mkv","49":"SEG Trailer 2"}},
++    {"title_id":34,"attributes":{"8":"1","9":"0:01:30","11":"215113728","16":"00702.mpls","27":"MOVIE-SEG Trailer 3_t34.mkv","49":"SEG Trailer 3"}},
++    {"title_id":35,"attributes":{"8":"1","9":"0:01:06","11":"157784064","16":"00703.mpls","27":"MOVIE-SEG Trailer 5_t35.mkv","49":"SEG Trailer 5"}},
++    {"title_id":36,"attributes":{"8":"1","9":"0:01:23","11":"198340608","16":"00704.mpls","27":"MOVIE-SEG Trailer 4_t36.mkv","49":"SEG Trailer 4"}},
++    {"title_id":37,"attributes":{"8":"1","9":"0:01:46","11":"253347840","16":"00705.mpls","27":"MOVIE-SEG Trailer 6_t37.mkv","49":"SEG Trailer 6"}},
++    {"title_id":38,"attributes":{"8":"1","9":"0:00:28","11":"83582976","16":"00710.mpls","27":"MOVIE-SEG DS 1_t38.mkv","49":"SEG DS 1"}},
++    {"title_id":39,"attributes":{"8":"1","9":"0:00:56","11":"163799040","16":"00713.mpls","27":"MOVIE-SEG DS 2_t39.mkv","49":"SEG DS 2"}},
++    {"title_id":40,"attributes":{"8":"1","9":"0:02:02","11":"356364288","16":"00714.mpls","27":"MOVIE-SEG DS 3_t40.mkv","49":"SEG DS 3"}},
++    {"title_id":41,"attributes":{"8":"1","9":"0:00:24","11":"71276544","16":"00715.mpls","27":"MOVIE-SEG DS 4_t41.mkv","49":"SEG DS 4"}},
++    {"title_id":42,"attributes":{"8":"1","9":"0:00:47","11":"137558016","16":"00716.mpls","27":"MOVIE-SEG DS 5_t42.mkv","49":"SEG DS 5"}},
++    {"title_id":43,"attributes":{"8":"1","9":"0:00:01","11":"1155072","16":"00717.mpls","27":"MOVIE-SF_WhatIsNeoX_t43.mkv","49":"SF_WhatIsNeoX"}},
++    {"title_id":44,"attributes":{"8":"1","9":"0:01:34","11":"294285312","16":"00719.mpls","27":"MOVIE-SF_DTS_71_t44.mkv","49":"SF_DTS_71"}},
++    {"title_id":45,"attributes":{"8":"1","9":"0:01:22","11":"241969152","16":"00720.mpls","27":"MOVIE-SF_DTS_51_t45.mkv","49":"SF_DTS_51"}},
++    {"title_id":46,"attributes":{"8":"16","9":"1:42:38","11":"27325857792","16":"00001.mpls","27":"MOVIE_t46.mkv"}},
++    {"title_id":47,"attributes":{"8":"17","9":"1:41:30","11":"27038005248","16":"00005.mpls","27":"MOVIE_t47.mkv"}},
++    {"title_id":48,"attributes":{"8":"17","9":"1:41:30","11":"27006738432","16":"00016.mpls","27":"MOVIE_t48.mkv"}},
++    {"title_id":49,"attributes":{"8":"17","9":"1:42:04","11":"27220316160","16":"00039.mpls","27":"MOVIE_t49.mkv"}},
++    {"title_id":50,"attributes":{"8":"17","9":"1:42:14","11":"27188029440","16":"00043.mpls","27":"MOVIE_t50.mkv"}},
++    {"title_id":51,"attributes":{"8":"17","9":"1:42:10","11":"27188115456","16":"00074.mpls","27":"MOVIE_t51.mkv"}},
++    {"title_id":52,"attributes":{"8":"17","9":"1:42:10","11":"27187851264","16":"00133.mpls","27":"MOVIE_t52.mkv"}},
++    {"title_id":53,"attributes":{"8":"17","9":"1:41:53","11":"27100084224","16":"00139.mpls","27":"MOVIE_t53.mkv"}},
++    {"title_id":54,"attributes":{"8":"17","9":"1:42:21","11":"27263293440","16":"00145.mpls","27":"MOVIE_t54.mkv"}},
++    {"title_id":55,"attributes":{"8":"17","9":"1:41:56","11":"27145052160","16":"00152.mpls","27":"MOVIE_t55.mkv"}},
++    {"title_id":56,"attributes":{"8":"17","9":"1:42:57","11":"27393730560","16":"00155.mpls","27":"MOVIE_t56.mkv"}},
++    {"title_id":57,"attributes":{"8":"17","9":"1:41:36","11":"27057371136","16":"00181.mpls","27":"MOVIE_t57.mkv"}},
++    {"title_id":58,"attributes":{"8":"17","9":"1:42:00","11":"27169640448","16":"00186.mpls","27":"MOVIE_t58.mkv"}},
++    {"title_id":59,"attributes":{"8":"17","9":"1:42:57","11":"27413581824","16":"00194.mpls","27":"MOVIE_t59.mkv"}},
++    {"title_id":60,"attributes":{"8":"17","9":"1:41:10","11":"26944880640","16":"00198.mpls","27":"MOVIE_t60.mkv"}},
++    {"title_id":61,"attributes":{"8":"17","9":"1:43:05","11":"27438612480","16":"00228.mpls","27":"MOVIE_t61.mkv"}},
++    {"title_id":62,"attributes":{"8":"17","9":"1:41:47","11":"27075274752","16":"00234.mpls","27":"MOVIE_t62.mkv"}},
++    {"title_id":63,"attributes":{"8":"17","9":"1:41:27","11":"26993565696","16":"00238.mpls","27":"MOVIE_t63.mkv"}},
++    {"title_id":64,"attributes":{"8":"17","9":"1:41:55","11":"27150802944","16":"00253.mpls","27":"MOVIE_t64.mkv"}},
++    {"title_id":65,"attributes":{"8":"17","9":"1:42:07","11":"27168970752","16":"00256.mpls","27":"MOVIE_t65.mkv"}},
++    {"title_id":66,"attributes":{"8":"17","9":"1:41:51","11":"27094683648","16":"00276.mpls","27":"MOVIE_t66.mkv"}},
++    {"title_id":67,"attributes":{"8":"16","9":"1:42:32","11":"27300784128","16":"00279.mpls","27":"MOVIE_t67.mkv"}},
++    {"title_id":68,"attributes":{"8":"16","9":"1:42:36","11":"27294898176","16":"00282.mpls","27":"MOVIE_t68.mkv"}},
++    {"title_id":69,"attributes":{"8":"17","9":"1:42:21","11":"27263293440","16":"00309.mpls","27":"MOVIE_t69.mkv"}},
++    {"title_id":70,"attributes":{"8":"17","9":"1:43:28","11":"27550881792","16":"00310.mpls","27":"MOVIE_t70.mkv"}},
++    {"title_id":71,"attributes":{"8":"17","9":"1:41:30","11":"27032297472","16":"00329.mpls","27":"MOVIE_t71.mkv"}},
++    {"title_id":72,"attributes":{"8":"17","9":"1:41:51","11":"27125950464","16":"00335.mpls","27":"MOVIE_t72.mkv"}},
++    {"title_id":73,"attributes":{"8":"17","9":"1:41:51","11":"27100127232","16":"00336.mpls","27":"MOVIE_t73.mkv"}},
++    {"title_id":74,"attributes":{"8":"16","9":"1:42:47","11":"27369811968","16":"00338.mpls","27":"MOVIE_t74.mkv"}},
++    {"title_id":75,"attributes":{"8":"17","9":"1:41:31","11":"27038269440","16":"00350.mpls","27":"MOVIE_t75.mkv"}},
++    {"title_id":76,"attributes":{"8":"17","9":"1:41:51","11":"27100127232","16":"00371.mpls","27":"MOVIE_t76.mkv"}},
++    {"title_id":77,"attributes":{"8":"17","9":"1:43:08","11":"27463464960","16":"00408.mpls","27":"MOVIE_t77.mkv"}},
++    {"title_id":78,"attributes":{"8":"17","9":"1:42:20","11":"27288324096","16":"00413.mpls","27":"MOVIE_t78.mkv"}},
++    {"title_id":79,"attributes":{"8":"16","9":"1:42:38","11":"27325857792","16":"00431.mpls","27":"MOVIE_t79.mkv"}},
++    {"title_id":80,"attributes":{"8":"16","9":"1:42:41","11":"27344738304","16":"00435.mpls","27":"MOVIE_t80.mkv"}},
++    {"title_id":81,"attributes":{"8":"17","9":"1:41:45","11":"27075053568","16":"00439.mpls","27":"MOVIE_t81.mkv"}},
++    {"title_id":82,"attributes":{"8":"16","9":"1:42:38","11":"27300298752","16":"00442.mpls","27":"MOVIE_t82.mkv"}},
++    {"title_id":83,"attributes":{"8":"17","9":"1:41:57","11":"27150759936","16":"00443.mpls","27":"MOVIE_t83.mkv"}},
++    {"title_id":84,"attributes":{"8":"17","9":"1:42:16","11":"27244191744","16":"00449.mpls","27":"MOVIE_t84.mkv"}},
++    {"title_id":85,"attributes":{"8":"17","9":"1:42:06","11":"27194714112","16":"00459.mpls","27":"MOVIE_t85.mkv"}},
++    {"title_id":86,"attributes":{"8":"17","9":"1:41:46","11":"27075581952","16":"00468.mpls","27":"MOVIE_t86.mkv"}},
++    {"title_id":87,"attributes":{"8":"17","9":"1:41:56","11":"27144787968","16":"00483.mpls","27":"MOVIE_t87.mkv"}},
++    {"title_id":88,"attributes":{"8":"17","9":"1:42:07","11":"27156983808","16":"00484.mpls","27":"MOVIE_t88.mkv"}},
++    {"title_id":89,"attributes":{"8":"17","9":"1:42:00","11":"27169904640","16":"00504.mpls","27":"MOVIE_t89.mkv"}},
++    {"title_id":90,"attributes":{"8":"16","9":"1:42:29","11":"27256344576","16":"00506.mpls","27":"MOVIE_t90.mkv"}},
++    {"title_id":91,"attributes":{"8":"17","9":"1:41:55","11":"27119536128","16":"00508.mpls","27":"MOVIE_t91.mkv"}},
++    {"title_id":92,"attributes":{"8":"17","9":"1:41:04","11":"26894512128","16":"00539.mpls","27":"MOVIE_t92.mkv"}},
++    {"title_id":93,"attributes":{"8":"17","9":"1:41:30","11":"27038005248","16":"00544.mpls","27":"MOVIE_t93.mkv"}},
++    {"title_id":94,"attributes":{"8":"17","9":"1:41:30","11":"27007002624","16":"00550.mpls","27":"MOVIE_t94.mkv"}},
++    {"title_id":95,"attributes":{"8":"16","9":"1:42:34","11":"27275446272","16":"00580.mpls","27":"MOVIE_t95.mkv"}},
++    {"title_id":96,"attributes":{"8":"16","9":"1:42:40","11":"27351017472","16":"00595.mpls","27":"MOVIE_t96.mkv"}},
++    {"title_id":97,"attributes":{"8":"17","9":"1:41:51","11":"27125686272","16":"00601.mpls","27":"MOVIE_t97.mkv"}},
++    {"title_id":98,"attributes":{"8":"16","9":"1:42:48","11":"27381491712","16":"00615.mpls","27":"MOVIE_t98.mkv"}},
++    {"title_id":99,"attributes":{"8":"17","9":"1:41:36","11":"27057371136","16":"00641.mpls","27":"MOVIE_t99.mkv"}},
++    {"title_id":100,"attributes":{"8":"17","9":"1:41:00","11":"26869395456","16":"00648.mpls","27":"MOVIE_t100.mkv"}},
++    {"title_id":101,"attributes":{"8":"17","9":"1:41:45","11":"27075317760","16":"00653.mpls","27":"MOVIE_t101.mkv"}},
++    {"title_id":102,"attributes":{"8":"17","9":"1:42:59","11":"27387979776","16":"00658.mpls","27":"MOVIE_t102.mkv"}},
++    {"title_id":103,"attributes":{"8":"17","9":"1:41:51","11":"27100391424","16":"00684.mpls","27":"MOVIE_t103.mkv"}},
++    {"title_id":104,"attributes":{"8":"17","9":"1:43:02","11":"27438127104","16":"00689.mpls","27":"MOVIE_t104.mkv"}},
++    {"title_id":105,"attributes":{"8":"17","9":"1:43:01","11":"27438434304","16":"00693.mpls","27":"MOVIE_t105.mkv"}},
++    {"title_id":106,"attributes":{"8":"17","9":"1:41:42","11":"27056173056","16":"00707.mpls","27":"MOVIE_t106.mkv"}},
++    {"title_id":107,"attributes":{"8":"17","9":"1:42:22","11":"27257278464","16":"00731.mpls","27":"MOVIE_t107.mkv"}},
++    {"title_id":108,"attributes":{"8":"17","9":"1:42:03","11":"27220051968","16":"00733.mpls","27":"MOVIE_t108.mkv"}},
++    {"title_id":109,"attributes":{"8":"17","9":"1:41:55","11":"27150538752","16":"00736.mpls","27":"MOVIE_t109.mkv"}},
++    {"title_id":110,"attributes":{"8":"16","9":"1:42:42","11":"27350974464","16":"00744.mpls","27":"MOVIE_t110.mkv"}},
++    {"title_id":111,"attributes":{"8":"17","9":"1:43:07","11":"27463507968","16":"00758.mpls","27":"MOVIE_t111.mkv"}},
++    {"title_id":112,"attributes":{"8":"17","9":"1:41:46","11":"27075581952","16":"00764.mpls","27":"MOVIE_t112.mkv"}},
++    {"title_id":113,"attributes":{"8":"17","9":"1:41:25","11":"26987900928","16":"00770.mpls","27":"MOVIE_t113.mkv"}},
++    {"title_id":114,"attributes":{"8":"17","9":"1:43:17","11":"27538685952","16":"00783.mpls","27":"MOVIE_t114.mkv"}},
++    {"title_id":115,"attributes":{"8":"17","9":"1:41:51","11":"27125686272","16":"00786.mpls","27":"MOVIE_t115.mkv"}},
++    {"title_id":116,"attributes":{"8":"17","9":"1:42:17","11":"27232468992","16":"00789.mpls","27":"MOVIE_t116.mkv"}},
++    {"title_id":117,"attributes":{"8":"17","9":"1:42:15","11":"27212660736","16":"00800.mpls","27":"MOVIE_t117.mkv"}},
++    {"title_id":118,"attributes":{"8":"17","9":"1:41:48","11":"27075538944","16":"00802.mpls","27":"MOVIE_t118.mkv"}},
++    {"title_id":119,"attributes":{"8":"17","9":"1:41:55","11":"27150802944","16":"00813.mpls","27":"MOVIE_t119.mkv"}},
++    {"title_id":120,"attributes":{"8":"17","9":"1:41:45","11":"27075317760","16":"00815.mpls","27":"MOVIE_t120.mkv"}},
++    {"title_id":121,"attributes":{"8":"17","9":"1:41:57","11":"27150759936","16":"00832.mpls","27":"MOVIE_t121.mkv"}},
++    {"title_id":122,"attributes":{"8":"17","9":"1:42:21","11":"27263293440","16":"00834.mpls","27":"MOVIE_t122.mkv"}},
++    {"title_id":123,"attributes":{"8":"16","9":"1:42:42","11":"27345266688","16":"00835.mpls","27":"MOVIE_t123.mkv"}},
++    {"title_id":124,"attributes":{"8":"17","9":"1:41:51","11":"27125686272","16":"00864.mpls","27":"MOVIE_t124.mkv"}},
++    {"title_id":125,"attributes":{"8":"17","9":"1:43:02","11":"27438127104","16":"00874.mpls","27":"MOVIE_t125.mkv"}},
++    {"title_id":126,"attributes":{"8":"17","9":"1:42:02","11":"27175569408","16":"00880.mpls","27":"MOVIE_t126.mkv"}},
++    {"title_id":127,"attributes":{"8":"17","9":"1:42:25","11":"27282438144","16":"00888.mpls","27":"MOVIE_t127.mkv"}},
++    {"title_id":128,"attributes":{"8":"17","9":"1:44:01","11":"27738372096","16":"00937.mpls","27":"MOVIE_t128.mkv"}},
++    {"title_id":129,"attributes":{"8":"17","9":"1:41:54","11":"27144830976","16":"00940.mpls","27":"MOVIE_t129.mkv"}},
++    {"title_id":130,"attributes":{"8":"16","9":"1:42:36","11":"27325900800","16":"00941.mpls","27":"MOVIE_t130.mkv"}},
++    {"title_id":131,"attributes":{"8":"17","9":"1:41:36","11":"27057371136","16":"00943.mpls","27":"MOVIE_t131.mkv"}},
++    {"title_id":132,"attributes":{"8":"17","9":"1:42:20","11":"27257321472","16":"00951.mpls","27":"MOVIE_t132.mkv"}},
++    {"title_id":133,"attributes":{"8":"17","9":"1:41:15","11":"26969690112","16":"00960.mpls","27":"MOVIE_t133.mkv"}},
++    {"title_id":134,"attributes":{"8":"17","9":"1:43:50","11":"27669829632","16":"00976.mpls","27":"MOVIE_t134.mkv"}},
++    {"title_id":135,"attributes":{"9":"0:00:10","11":"1050624","16":"00272.m2ts","27":"MOVIE_t135.mkv"}},
++    {"title_id":136,"attributes":{"9":"0:00:10","11":"1050624","16":"00273.m2ts","27":"MOVIE_t136.mkv"}},
++    {"title_id":137,"attributes":{"9":"0:00:10","11":"1050624","16":"00274.m2ts","27":"MOVIE_t137.mkv"}},
++    {"title_id":138,"attributes":{"9":"0:00:00","11":"227328","16":"00275.m2ts","27":"MOVIE_t138.mkv"}}
++  ]
++}
+diff --git a/test/local/test_movie_selection.py b/test/local/test_movie_selection.py
+new file mode 100644
+index 0000000..02f7a67
+--- /dev/null
++++ b/test/local/test_movie_selection.py
+@@ -0,0 +1,200 @@
++"""Pinned parser + policy + routing tests; no Flask, devices or live workload."""
++import copy
++import dataclasses
++import enum
++import importlib.util
++import json
++import logging
++from pathlib import Path
++from types import SimpleNamespace as NS
++import unittest
++from unittest.mock import Mock
++from test_reliability import load, ROOT
++
++spec = importlib.util.spec_from_file_location('movie_selection', ROOT / 'arm/ripper/movie_selection.py')
++policy = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(policy)
++FIXTURE = json.loads((Path(__file__).parent / 'fixtures/movie-139.json').read_text())
++
++
++def parse_fixture(fixture=FIXTURE):
++    tracks = []
++    def put(job, tid, seconds, aspect, fps, main, source, filename, chapters, size):
++        tracks.append(NS(track_number=tid, length=seconds, filename=filename,
++                         main_feature=main, process=True))
++    job = NS(no_of_titles=None, tracks=tracks)
++    utils = NS(put_track=put, database_updater=lambda values, j: j.__dict__.update(values))
++    ns = load('arm/ripper/makemkv.py', {'StreamID', 'TrackID', 'Titles', 'CInfo', 'TInfo', 'SInfo',
++              'TrackInfoProcessor', 'convert_to_seconds'}, dict(enum=enum, dataclasses=dataclasses,
++              logging=logging, utils=utils, SOURCE='MakeMKV', MAKEMKV_STREAM_CODE_TYPE_VIDEO=6201))
++    processor = ns['TrackInfoProcessor'](job, 0)
++    processor._process_message(ns['Titles'](fixture['title_count']))
++    for row in fixture['titles']:
++        for attr, value in row['attributes'].items():
++            processor._process_message(ns['TInfo'](id=int(attr), code=0, value=value, tid=row['title_id']))
++    processor._add_track()
++    return processor.inventory, job, ns
++
++
++class MovieSelection(unittest.TestCase):
++    def setUp(self):
++        self.rows, self.job, self.parser = parse_fixture()
++
++    def choose(self, rows=None, **config):
++        return policy.select_movie(self.rows if rows is None else rows, config, 4)
++
++    def test_retained_139_explicit_marker_beats_larger_title(self):
++        result = self.choose()
++        self.assertEqual(len(result['candidates']), 139)
++        self.assertEqual((result['policy'], result['title_id']), ('explicit', 32))
++        chosen = self.rows[32]
++        self.assertEqual((chosen['source_file'], chosen['duration_seconds']), ('00609.mpls', 6161))
++        self.assertEqual(result['reason'], 'UNIQUE_TINFO_49_FPL_MAINFEATURE')
++        self.assertTrue(self.job.tracks[32].main_feature)
++        self.assertFalse(self.job.tracks[33].main_feature)  # parser reset
++        self.assertEqual(self.choose(MOVIE_SELECTION_STRATEGY='heuristic')['title_id'], 128)
++
++    def test_absent_marker_does_not_infer_from_filename_or_size(self):
++        rows = copy.deepcopy(self.rows)
++        rows[32]['main_feature'] = False
++        result = self.choose(rows)
++        self.assertIsNone(result['title_id'])
++        self.assertEqual(result['reason'], 'EXPLICIT_UNAVAILABLE')
++        self.assertEqual(len(result['candidates']), 139)
++        self.assertEqual(self.choose(rows, MOVIE_SELECTION_FALLBACK='heuristic')['title_id'], 128)
++
++    def test_conflicting_candidates_require_operator(self):
++        rows = copy.deepcopy(self.rows)
++        rows[128]['main_feature'] = True
++        self.assertIsNone(self.choose(rows)['title_id'])
++        self.assertEqual(self.choose(rows)['reason'], 'EXPLICIT_AMBIGUOUS')
++        rows[128]['main_feature'] = False
++        rows[32]['identification_conflict'] = True
++        self.assertIsNone(self.choose(rows)['title_id'])
++
++    def test_not_hardcoded_to_title_32(self):
++        rows = copy.deepcopy(self.rows)
++        rows[32]['main_feature'] = False
++        rows[70]['main_feature'] = True
++        self.assertEqual(self.choose(rows)['title_id'], 70)
++
++    def test_manual_override_binds_job_and_inventory_and_preserves_zero(self):
++        config = dict(MOVIE_SELECTION_STRATEGY='manual', MOVIE_SELECTION_MANUAL_JOB_ID=4,
++                      MOVIE_SELECTION_MANUAL_INVENTORY_SHA256=self.choose()['inventory_sha256'],
++                      MOVIE_SELECTION_MANUAL_TITLE_ID=0)
++        self.assertEqual(self.choose(**config)['title_id'], 0)
++        self.assertIsNone(policy.select_movie(self.rows, config, 5)['title_id'])
++        rows = copy.deepcopy(self.rows)
++        rows[0]['source_file'] = 'different-disc.mpls'
++        self.assertIsNone(self.choose(rows, **config)['title_id'])
++        config['MOVIE_SELECTION_MANUAL_TITLE_ID'] = 999
++        self.assertEqual(self.choose(**config)['reason'], 'MANUAL_TITLE_NOT_FOUND')
++        config['MOVIE_SELECTION_MANUAL_TITLE_ID'] = True
++        self.assertIsNone(self.choose(**config)['title_id'])
++
++    def test_heuristic_tie_uses_numeric_title_id_not_list_order(self):
++        rows = [dict(self.rows[0], title_id=i) for i in (10, 2)]
++        self.assertEqual(self.choose(rows, MOVIE_SELECTION_STRATEGY='heuristic')['title_id'], 2)
++
++    def test_invalid_policy_and_unknown_media_do_not_auto_select(self):
++        self.assertIsNone(self.choose(MOVIE_SELECTION_STRATEGY='largest')['title_id'])
++        self.assertIsNone(self.choose(MOVIE_SELECTION_FALLBACK='explicit')['title_id'])
++        self.assertIsNone(policy.select_movie(self.rows, {}, 4, 'unknown')['title_id'])
++        self.assertIsNone(self.choose([])['title_id'])
++
++    def test_parser_never_treats_filename_or_near_marker_as_identification(self):
++        fixture = copy.deepcopy(FIXTURE)
++        fixture['titles'][32]['attributes']['49'] = 'FPL_MainFeature_extra'
++        rows, _, _ = parse_fixture(fixture)
++        self.assertIsNone(self.choose(rows)['title_id'])
++        del fixture['titles'][32]['attributes']['49']
++        rows, _, _ = parse_fixture(fixture)
++        self.assertIsNone(self.choose(rows)['title_id'])
++
++    def routing(self, kind='movie', config=None, wait=None, rows=None):
++        job = self.job
++        job.__dict__.update(video_type=kind, job_id=4, devpath='/dev/synthetic', drive=NS(mdisc=0),
++                            config=NS(MAINFEATURE=False, MAXLENGTH=99998), manual_start=True)
++        ns = dict(utils=NS(get_drive_mode=lambda _: 'auto', RipperException=RuntimeError),
++                  logging=logging, json=json, cfg=NS(arm_config=config or {}), select_movie=policy.select_movie,
++                  get_track_info=Mock(return_value=self.rows if rows is None else rows),
++                  rip_mainfeature=Mock(), process_single_tracks=Mock(), manual_wait=Mock(side_effect=wait or (lambda _: False)),
++                  db=NS(session=Mock()), JobState=NS(VIDEO_WAITING=NS(value='waiting'), VIDEO_RIPPING=NS(value='ripping')))
++        load('arm/ripper/makemkv.py', {'makemkv_mkv'}, ns)
++        return job, ns
++
++    def test_movie_routing_uses_policy_even_when_mainfeature_false(self):
++        job, ns = self.routing()
++        ns['makemkv_mkv'](job, '/unused')
++        self.assertEqual(ns['rip_mainfeature'].call_args.args[1].track_number, 32)
++        ns['manual_wait'].assert_not_called()
++        ns['process_single_tracks'].assert_not_called()
++
++    def test_missing_identification_waits_and_clears_stale_choices(self):
++        rows = copy.deepcopy(self.rows)
++        rows[32]['main_feature'] = False
++        job, ns = self.routing(rows=rows)
++        with self.assertRaisesRegex(RuntimeError, 'operator input'):
++            ns['makemkv_mkv'](job, '/unused')
++        self.assertFalse(job.manual_start)
++        self.assertFalse(any(t.process for t in job.tracks))
++        ns['rip_mainfeature'].assert_not_called()
++
++    def test_operator_selection_is_exactly_one_current_title(self):
++        def wait(job):
++            self.assertFalse(any(t.process for t in job.tracks))
++            job.tracks[7].process = True
++            return True
++        job, ns = self.routing(config={'MOVIE_SELECTION_STRATEGY': 'manual'}, wait=wait)
++        ns['makemkv_mkv'](job, '/unused')
++        self.assertEqual(ns['rip_mainfeature'].call_args.args[1].track_number, 7)
++        def two(job):
++            job.tracks[0].process = job.tracks[1].process = True
++            return True
++        job, ns = self.routing(config={'MOVIE_SELECTION_STRATEGY': 'manual'}, wait=two)
++        with self.assertRaisesRegex(RuntimeError, 'exactly one'):
++            ns['makemkv_mkv'](job, '/unused')
++        ns['rip_mainfeature'].assert_not_called()
++
++    def test_partial_inventory_never_rips(self):
++        job, ns = self.routing(rows=self.rows[:-1])
++        with self.assertRaisesRegex(RuntimeError, 'complete title inventory'):
++            ns['makemkv_mkv'](job, '/unused')
++        ns['rip_mainfeature'].assert_not_called()
++
++    def test_conflicting_parser_attributes_cannot_become_unique_identification(self):
++        _, job, ns = parse_fixture()
++        processor = ns['TrackInfoProcessor'](job, 0)
++        for value in ('FPL_MainFeature', 'FPL_Other'):
++            processor._process_message(ns['TInfo'](id=49, code=0, value=value, tid=0))
++        processor._add_track()
++        self.assertTrue(processor.inventory[0]['identification_conflict'])
++        self.assertIsNone(self.choose(processor.inventory)['title_id'])
++
++    def test_series_ten_titles_including_shorts_keeps_all_title_command(self):
++        job, ns = self.routing(kind='series')
++        job.config.MAXLENGTH = 99999
++        job.config.MINLENGTH = 0
++        job.config.MKV_ARGS = ''
++        job.tracks = [NS(track_number=i, length=9 if i == 8 else 13 if i == 9 else 1300)
++                      for i in range(10)]
++        job.no_of_titles = 10
++        import collections, shlex
++        ns.update(collections=collections, shlex=shlex, progress_log=lambda _: '/unused/progress',
++                  run=Mock(return_value=iter(())), OutputType=NS(MSG='MSG'))
++        ns['select_movie'] = Mock(side_effect=AssertionError('TV entered movie selector'))
++        ns['makemkv_mkv'](job, '/unused')
++        command = ns['run'].call_args.args[0]
++        self.assertIn('all', command)
++        self.assertIn('--minlength=0', command)
++        self.assertEqual([t.length for t in job.tracks][-2:], [9, 13])
++        ns['rip_mainfeature'].assert_not_called()
++
++    def test_series_keeps_existing_auto_and_manual_routing(self):
++        for mode in ('auto', 'manual'):
++            job, ns = self.routing(kind='series', wait=lambda _: True)
++            ns['utils'].get_drive_mode = lambda _: mode
++            ns['select_movie'] = Mock(side_effect=AssertionError('TV entered movie selector'))
++            ns['makemkv_mkv'](job, '/unused')
++            ns['process_single_tracks'].assert_called_once_with(job, '/unused', mode)
++            ns['rip_mainfeature'].assert_not_called()
+-- 
+2.53.0
+
