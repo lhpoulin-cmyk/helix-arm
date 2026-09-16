@@ -1,5 +1,5 @@
-From 6059fca932d893312d2d9fecec4dedc1ca37da84 Mon Sep 17 00:00:00 2001
-From: "Louis H. Poulin II" <lhpoulin@gmail.com>
+From 1431da3ee5cf1635296d83993ae58fa44b27d62d Mon Sep 17 00:00:00 2001
+From: Helix ARM <helix-arm@localhost>
 Date: Wed, 16 Sep 2026 23:33:32 +0000
 Subject: [PATCH] Enable authenticated manual controls for movie fallback jobs
 
