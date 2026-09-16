@@ -1,3 +1,13 @@
+## 2026-09-16 — Configurable movie-selection wait (prepared)
+
+MOVIE_SELECTION_WAIT_SECONDS defaults to1800; testing may set60. Movie waits
+poll every5seconds against a monotonic deadline, reject invalid values and stop
+without ripping at timeout. TV waits and MANUAL_WAIT_TIME remain unchanged.
+The setting is captured at job startup and cannot shorten an active old worker.
+Four timeout regressions pass; independent replay passes45 B70 tests and40
+product tests, including22 focused selection tests. No live installation or
+processing is claimed. Apply0004 after0003; arm-cp owns deployment and rollback.
+
 ## 2026-09-16 — Manual selection UI correction (prepared)
 
 Movie fallback set waiting without manual_mode, leaving job-detail controls

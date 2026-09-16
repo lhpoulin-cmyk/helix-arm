@@ -1,0 +1,153 @@
+From 64f50e46f6089765d41d2e1bfda5b717f4d1bd23 Mon Sep 17 00:00:00 2001
+From: Helix ARM <helix-arm@localhost>
+Date: Wed, 16 Sep 2026 23:43:45 +0000
+Subject: [PATCH] Make movie operator wait configurable for bounded testing
+
+---
+ arm/ripper/makemkv.py              | 28 +++++++++++++++++++++-
+ arm/ui/comments.json               |  1 +
+ arm_wiki/Movie-selection.md        |  8 +++++++
+ setup/arm.yaml                     |  2 ++
+ test/local/test_movie_selection.py | 37 ++++++++++++++++++++++++++++++
+ 5 files changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/arm/ripper/makemkv.py b/arm/ripper/makemkv.py
+index 43c5717..f01c567 100644
+--- a/arm/ripper/makemkv.py
++++ b/arm/ripper/makemkv.py
+@@ -18,7 +18,7 @@ import re
+ import shlex
+ import shutil
+ import subprocess
+-from time import sleep, time
++from time import sleep, time, monotonic
+ 
+ import arm.config.config as cfg
+ from arm.models import SystemDrives, Track
+@@ -1299,6 +1299,29 @@ def run(options, select):
+         raise MakeMkvRuntimeError(proc.returncode, cmd, output=os.linesep.join(buffer))
+ 
+ 
++def movie_selection_wait(job):
++    """Bounded movie-only operator wait; timeout never selects a title."""
++    seconds = cfg.arm_config.get('MOVIE_SELECTION_WAIT_SECONDS', 1800)
++    if type(seconds) is not int or not 5 <= seconds <= 1800:
++        raise utils.RipperException('MOVIE_SELECTION_WAIT_SECONDS must be an integer from 5 to 1800')
++    deadline = monotonic() + seconds
++    logging.info('MOVIE_SELECTION_WAIT job=%s timeout_seconds=%s', job.job_id, seconds)
++    notify(job, 'Movie selection required', f'Select one title within {seconds} seconds; timeout stops without ripping.')
++    while True:
++        remaining = deadline - monotonic()
++        if remaining <= 0:
++            logging.info('MOVIE_SELECTION_WAIT job=%s result=TIMEOUT', job.job_id)
++            return False
++        sleep(min(5, remaining))
++        # Do not accept a start signal after the deadline.
++        if monotonic() >= deadline:
++            logging.info('MOVIE_SELECTION_WAIT job=%s result=TIMEOUT', job.job_id)
++            return False
++        db.session.refresh(job)
++        if job.manual_start:
++            return True
++
++
+ def manual_wait(job) -> bool:
+     """
+     Pause execution to allow for user interaction and monitor job readiness.
+@@ -1322,6 +1345,9 @@ def manual_wait(job) -> bool:
+         - A final notification is sent when one minute is left, warning of potential
+           cancellation.
+     """
++    if job.video_type != 'series':
++        return movie_selection_wait(job)
++
+     user_ready = False
+     wait_time: int = 30
+ 
+diff --git a/arm/ui/comments.json b/arm/ui/comments.json
+index 5009ca8..e8ed118 100644
+--- a/arm/ui/comments.json
++++ b/arm/ui/comments.json
+@@ -1,4 +1,5 @@
+ {
++    "MOVIE_SELECTION_WAIT_SECONDS": "# Movie operator-selection timeout: integer 5..1800 seconds; default 1800, testing 60. TV waits unchanged.",
+     "MOVIE_SELECTION_STRATEGY": "# MakeMKV movie policy: explicit, heuristic, manual. See arm_wiki/Movie-selection.md.",
+     "MOVIE_SELECTION_FALLBACK": "# When explicit identification is absent or ambiguous: manual (default) or heuristic.",
+     "MOVIE_SELECTION_MANUAL_JOB_ID": "# Manual override requires this exact current job ID; -1 is unset.",
+diff --git a/arm_wiki/Movie-selection.md b/arm_wiki/Movie-selection.md
+index 8eb60d3..9b032b3 100644
+--- a/arm_wiki/Movie-selection.md
++++ b/arm_wiki/Movie-selection.md
+@@ -76,3 +76,11 @@ The job-detail page also accepts an existing non-series waiting job whose flag
+ was omitted by the earlier release. Controls remain disabled once submitted or
+ outside waiting; series UI behavior is unchanged. Authentication and CSRF remain
+ required. This fixes form visibility, not metadata credentials or classification.
++
++## Testing the wait
++
++MOVIE_SELECTION_WAIT_SECONDS is an integer5..1800, default1800. Set60 for
++movie-selection testing. Movie waits poll every5seconds against a monotonic
++deadline; timeout stops without selecting or ripping. TV waits are unchanged.
++This is separate from MANUAL_WAIT_TIME (identification/MakeMKV scheduling).
++Configuration is captured by the job process; it cannot change an active wait.
+diff --git a/setup/arm.yaml b/setup/arm.yaml
+index e23a6c9..4a711c8 100755
+--- a/setup/arm.yaml
++++ b/setup/arm.yaml
+@@ -253,6 +253,8 @@ MAINFEATURE: false
+ # See arm_wiki/Movie-selection.md. TV routing remains unchanged.
+ MOVIE_SELECTION_STRATEGY: explicit  # explicit | heuristic | manual
+ MOVIE_SELECTION_FALLBACK: manual   # manual | heuristic
++# Movie operator-selection timeout in seconds (integer 5..1800); tests may use 60.
++MOVIE_SELECTION_WAIT_SECONDS: 1800
+ # Optional manual override: ALL three values must match the current attempt.
+ # Use the job ID and inventory hash reported in MOVIE_SELECTION; no global title.
+ MOVIE_SELECTION_MANUAL_JOB_ID: -1
+diff --git a/test/local/test_movie_selection.py b/test/local/test_movie_selection.py
+index ad71dcb..66ce423 100644
+--- a/test/local/test_movie_selection.py
++++ b/test/local/test_movie_selection.py
+@@ -234,3 +234,40 @@ class ManualSelectionUI(unittest.TestCase):
+     def test_series_manual_ui_behavior_unchanged(self):
+         self.assertFalse(self.page(kind='series')['manual_edit'])
+         self.assertTrue(self.page(kind='series', manual=True)['manual_edit'])
++
++
++class MovieSelectionWait(unittest.TestCase):
++    def run_wait(self, config, choose_at=None, oversleep=0):
++        clock=[0.0];sleeps=[]
++        job=NS(job_id=4, manual_start=False, video_type='unknown')
++        def sleep(seconds):
++            sleeps.append(seconds);clock[0]+=seconds+oversleep
++        def refresh(job):
++            job.manual_start=choose_at is not None and clock[0]>=choose_at
++        ns=dict(cfg=NS(arm_config=config), utils=NS(RipperException=ValueError),
++                logging=logging, notify=Mock(), monotonic=lambda:clock[0], sleep=sleep,
++                db=NS(session=NS(refresh=refresh)))
++        load('arm/ripper/makemkv.py', {'movie_selection_wait'}, ns)
++        result=ns['movie_selection_wait'](job)
++        return result,clock[0],sleeps
++
++    def test_testing_timeout_is_sixty_seconds_without_selection(self):
++        result,elapsed,sleeps=self.run_wait({'MOVIE_SELECTION_WAIT_SECONDS':60})
++        self.assertFalse(result);self.assertEqual(elapsed,60);self.assertEqual(max(sleeps),5)
++
++    def test_default_remains_thirty_minutes_and_start_is_prompt(self):
++        self.assertEqual(self.run_wait({})[:2],(False,1800))
++        self.assertEqual(self.run_wait({'MOVIE_SELECTION_WAIT_SECONDS':60},choose_at=5)[:2],(True,5))
++
++    def test_invalid_values_and_late_start_cannot_extend_deadline(self):
++        for value in (True,0,-1,4,1801,'60',None):
++            with self.assertRaises(ValueError):self.run_wait({'MOVIE_SELECTION_WAIT_SECONDS':value})
++        self.assertEqual(self.run_wait({'MOVIE_SELECTION_WAIT_SECONDS':60},choose_at=1,oversleep=60)[0],False)
++
++    def test_tv_keeps_original_wait_and_never_reads_movie_timeout(self):
++        job=NS(video_type='series',manual_start=False);sleeps=[]
++        ns=dict(movie_selection_wait=Mock(side_effect=AssertionError('TV changed')),
++                notify=Mock(),sleep=sleeps.append,logging=logging,db=NS(session=Mock()))
++        load('arm/ripper/makemkv.py', {'manual_wait'}, ns)
++        self.assertFalse(ns['manual_wait'](job));self.assertEqual(sleeps,[60]*30)
++        ns['movie_selection_wait'].assert_not_called()
+-- 
+2.53.0
+

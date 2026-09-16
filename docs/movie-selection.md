@@ -94,3 +94,12 @@ job-detail UI also handles waiting non-series jobs created before this correctio
 Three additional tests execute the real job-detail handler and inspect checkbox
 state. This fixes operator controls, not missing metadata-provider credentials.
 No automatic title selection, database migration or broader access is added.
+
+## Configurable movie wait
+
+[0004-movie-selection-wait.patch](../patches/arm/0004-movie-selection-wait.patch)
+adds MOVIE_SELECTION_WAIT_SECONDS (integer5..1800, default1800). Use60 for
+testing. The [manifest](../patches/arm/movie-selection-wait.json) pins replay
+trees. Movie waits poll every5seconds with a monotonic deadline; TV waits remain
+unchanged. MANUAL_WAIT_TIME is a separate identification/scheduling setting.
+No active job is reconfigured, interrupted or automatically selected.

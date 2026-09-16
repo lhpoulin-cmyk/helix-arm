@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "owner": "helix-arm",
+  "patch": "0004-movie-selection-wait.patch",
+  "patch_sha256": "83a29c9ebb8126b0bb2d090d3cd5d0c1970662b9fbd4225588a775fedb807217",
+  "source_commit": "64f50e46f6089765d41d2e1bfda5b717f4d1bd23",
+  "b70_base_tree": "380107975d9a027cf697d8f06b45e04a6cdaac1f",
+  "b70_result_tree": "daa9c109b70e6eab8fa4c5ce843fb93bfa0b44d6",
+  "product_result_tree": "120513608cdedb200b1399f8be8e6a642997404f",
+  "focused_tests": 22,
+  "b70_tests": 45,
+  "product_tests": 40,
+  "deployment": "NOT_INSTALLED"
+}
