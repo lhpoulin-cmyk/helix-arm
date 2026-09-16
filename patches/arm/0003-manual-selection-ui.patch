@@ -1,0 +1,116 @@
+From 6059fca932d893312d2d9fecec4dedc1ca37da84 Mon Sep 17 00:00:00 2001
+From: "Louis H. Poulin II" <lhpoulin@gmail.com>
+Date: Wed, 16 Sep 2026 23:33:32 +0000
+Subject: [PATCH] Enable authenticated manual controls for movie fallback jobs
+
+---
+ arm/ripper/makemkv.py              |  1 +
+ arm/ui/jobs/jobs.py                |  2 +-
+ arm_wiki/Movie-selection.md        |  8 +++++++
+ test/local/test_movie_selection.py | 38 +++++++++++++++++++++++++++++-
+ 4 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/arm/ripper/makemkv.py b/arm/ripper/makemkv.py
+index 280d09b..43c5717 100644
+--- a/arm/ripper/makemkv.py
++++ b/arm/ripper/makemkv.py
+@@ -684,6 +684,7 @@ def makemkv_mkv(job, rawpath):
+         if decision['title_id'] is None:
+             # Existing ARM UI supplies attempt-local choices. Never inherit a
+             # previous start signal or the automatically populated track flags.
++            job.manual_mode = True
+             job.manual_start = False
+             for track in job.tracks:
+                 track.process = False
+diff --git a/arm/ui/jobs/jobs.py b/arm/ui/jobs/jobs.py
+index 2a843f0..ee99ae5 100644
+--- a/arm/ui/jobs/jobs.py
++++ b/arm/ui/jobs/jobs.py
+@@ -49,7 +49,7 @@ def jobdetail():
+         raise ValueError('Job not found')
+ 
+     # Check if a manual job, waiting for input and user has not provided input
+-    if job.manual_mode and job.status == JobState.MANUAL_WAIT_STARTED.value and not job.manual_start:
++    if (job.manual_mode or job.video_type != 'series') and job.status == JobState.MANUAL_WAIT_STARTED.value and not job.manual_start:
+         manual_edit = True
+ 
+     # Get Job and Track data
+diff --git a/arm_wiki/Movie-selection.md b/arm_wiki/Movie-selection.md
+index 31526a2..8eb60d3 100644
+--- a/arm_wiki/Movie-selection.md
++++ b/arm_wiki/Movie-selection.md
+@@ -68,3 +68,11 @@ evidence, not a fresh optical binding or actual extraction success.
+ Deploy only through the workload owner's reviewed source/image release. No
+ runtime changes, disc reads or rip acceptance accompany source tests. Restore
+ the previous matched image/configuration to roll back; retain all logs/media.
++
++## Manual fallback UI correction
++
++Non-series fallback sets the current job's manual_mode flag before waiting.
++The job-detail page also accepts an existing non-series waiting job whose flag
++was omitted by the earlier release. Controls remain disabled once submitted or
++outside waiting; series UI behavior is unchanged. Authentication and CSRF remain
++required. This fixes form visibility, not metadata credentials or classification.
+diff --git a/test/local/test_movie_selection.py b/test/local/test_movie_selection.py
+index 02f7a67..ad71dcb 100644
+--- a/test/local/test_movie_selection.py
++++ b/test/local/test_movie_selection.py
+@@ -114,7 +114,7 @@ class MovieSelection(unittest.TestCase):
+     def routing(self, kind='movie', config=None, wait=None, rows=None):
+         job = self.job
+         job.__dict__.update(video_type=kind, job_id=4, devpath='/dev/synthetic', drive=NS(mdisc=0),
+-                            config=NS(MAINFEATURE=False, MAXLENGTH=99998), manual_start=True)
++                            config=NS(MAINFEATURE=False, MAXLENGTH=99998), manual_start=True, manual_mode=False)
+         ns = dict(utils=NS(get_drive_mode=lambda _: 'auto', RipperException=RuntimeError),
+                   logging=logging, json=json, cfg=NS(arm_config=config or {}), select_movie=policy.select_movie,
+                   get_track_info=Mock(return_value=self.rows if rows is None else rows),
+@@ -137,6 +137,7 @@ class MovieSelection(unittest.TestCase):
+         with self.assertRaisesRegex(RuntimeError, 'operator input'):
+             ns['makemkv_mkv'](job, '/unused')
+         self.assertFalse(job.manual_start)
++        self.assertTrue(job.manual_mode)
+         self.assertFalse(any(t.process for t in job.tracks))
+         ns['rip_mainfeature'].assert_not_called()
+ 
+@@ -198,3 +199,38 @@ class MovieSelection(unittest.TestCase):
+             ns['makemkv_mkv'](job, '/unused')
+             ns['process_single_tracks'].assert_called_once_with(job, '/unused', mode)
+             ns['rip_mainfeature'].assert_not_called()
++
++
++class ManualSelectionUI(unittest.TestCase):
++    def page(self, kind='unknown', status='waiting', manual=False, started=False):
++        entries = []
++        def append(row):
++            entries.append(NS(checkbox=NS(render_kw={})))
++        form = NS(track_ref=NS(entries=entries, append_entry=append))
++        job = NS(manual_mode=manual, manual_start=started, status=status,
++                 video_type=kind, tracks=NS(all=lambda: [NS(track_id=32, process=False)]),
++                 title='synthetic', year='', imdb_id='')
++        ns = dict(route_jobs=NS(route=lambda *a, **k: lambda f: f), login_required=lambda f: f,
++                  TrackFormDynamic=lambda: form, request=NS(args={'job_id': '4'}),
++                  Job=NS(query=NS(get=lambda _: job)),
++                  JobState=NS(MANUAL_WAIT_STARTED=NS(value='waiting')),
++                  app=NS(logger=Mock()), ui_utils=NS(metadata_selector=lambda *a: None),
++                  render_template=lambda template, **kw: kw)
++        load('arm/ui/jobs/jobs.py', {'jobdetail'}, ns)
++        return ns['jobdetail']()
++
++    def test_existing_nonmanual_movie_wait_exposes_real_form_controls(self):
++        for kind in ('unknown', 'movie'):
++            page = self.page(kind=kind)
++            self.assertTrue(page['manual_edit'])
++            self.assertNotIn('disabled', page['form'].track_ref.entries[0].checkbox.render_kw)
++
++    def test_started_active_and_terminal_jobs_have_disabled_controls(self):
++        for options in ({'started': True}, {'status': 'ripping'}, {'status': 'success'}, {'status': 'fail'}):
++            page = self.page(**options)
++            self.assertFalse(page['manual_edit'])
++            self.assertIn('disabled', page['form'].track_ref.entries[0].checkbox.render_kw)
++
++    def test_series_manual_ui_behavior_unchanged(self):
++        self.assertFalse(self.page(kind='series')['manual_edit'])
++        self.assertTrue(self.page(kind='series', manual=True)['manual_edit'])
+-- 
+2.53.0
+

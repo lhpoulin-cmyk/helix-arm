@@ -1,3 +1,14 @@
+## 2026-09-16 — Manual selection UI correction (prepared)
+
+Movie fallback set waiting without manual_mode, leaving job-detail controls
+disabled. The additive [patch](patches/arm/0003-manual-selection-ui.patch) sets
+that flag and exposes controls for existing non-series waiting jobs. Submitted,
+active and terminal jobs remain disabled; TV behavior, authentication and CSRF
+are unchanged. Three form-level regressions supplement the routing assertion.
+41 B70 source tests pass, including18 focused selection tests. Source tests do
+not establish installation or live extraction. arm-cp owns the workload upgrade;
+retain the prior image for rollback and all job/media records.
+
 # Current state
 
 ## 2026-09-16 — Movie-selection source repair verified, not deployed

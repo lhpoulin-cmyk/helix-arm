@@ -84,3 +84,13 @@ arm-cp source lock and root-owned executor remain unchanged. Image build,
 workload pin adoption and live qualification are separate controlled steps.
 The protected executor has no authority to load this patch from a writable
 checkout. Do not bypass that boundary or rerip to test selection.
+
+## Manual UI follow-up
+
+Apply [0003-manual-selection-ui.patch](../patches/arm/0003-manual-selection-ui.patch)
+after0002. [Its manifest](../patches/arm/manual-selection-ui.json) records the
+source binding. The fallback now marks the job manual; the existing authenticated
+job-detail UI also handles waiting non-series jobs created before this correction.
+Three additional tests execute the real job-detail handler and inspect checkbox
+state. This fixes operator controls, not missing metadata-provider credentials.
+No automatic title selection, database migration or broader access is added.

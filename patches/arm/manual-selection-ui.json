@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "owner": "helix-arm",
+  "patch": "0003-manual-selection-ui.patch",
+  "patch_sha256": "406287636559184282c4dec3fb3248906960c163f051f538f849824adf4df448",
+  "source_commit": "6059fca932d893312d2d9fecec4dedc1ca37da84",
+  "b70_base_tree": "2d15943e4119d4573e521b8d8518500b79a978da",
+  "b70_result_tree": "380107975d9a027cf697d8f06b45e04a6cdaac1f",
+  "focused_tests": 18,
+  "b70_tests": 41,
+  "deployment": "NOT_INSTALLED",
+  "product_result_tree": "71be64714c8eedf760443aaf91fa306276f9537c",
+  "product_tests": 36
+}
