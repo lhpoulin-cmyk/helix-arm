@@ -1,3 +1,14 @@
+## 2026-09-17 — Explicit selection independent of metadata classification
+
+A boolean MOVIE_SELECTION_ALLOW_UNKNOWN_EXPLICIT opt-in (defaultfalse) allows
+strategyexplicit to select a unique MakeMKV main-feature marker while type remains
+unknown. Conflicts or missing/multiple markers require an operator; no heuristic
+fallback applies to unknown discs. Known TV routing, including short titles,
+is unchanged. Selection records preserve unknown metadata and log the policy.
+Independent replay passes52 B70 and47 product tests, including29 focused tests.
+This is prepared source, not installed or a successful extraction. Apply0006
+after0005; deployment and rollback remain with the workload authority.
+
 ## 2026-09-17 — Optional metadata and scoped manual selection
 
 OMDb requests now stop locally when its key is absent/empty, with a clear reduced

@@ -114,3 +114,14 @@ inventory SHA-256 and title ID supports an unclassified disc without requiring
 an online account. Incomplete/stale overrides stop; no marker is promoted to
 movie classification. Authenticated current-job UI selection remains supported.
 [The manifest](../patches/arm/optional-omdb.json) pins the incremental replay.
+
+## Unclassified explicit selection opt-in
+
+[0006-unclassified-explicit-selection.patch](../patches/arm/0006-unclassified-explicit-selection.patch)
+adds MOVIE_SELECTION_ALLOW_UNKNOWN_EXPLICIT (booleanfalse by default). When true
+with strategyexplicit, a unique FPL_MainFeature marker without any identification
+conflict can choose a title despite unknown metadata type. Missing/multiple or
+conflicting markers require operator input even if fallbackheuristic is configured.
+It does not infer movie/TV classification, title/year or episode identity. Known
+series keep all existing behavior. The decision logs the opt-in, unknown type
+and unclassified explicit reason. [Manifest](../patches/arm/unclassified-explicit-selection.json).
