@@ -1,0 +1,165 @@
+From eafcf289bc6930d2551849c869303a6c916a4a2a Mon Sep 17 00:00:00 2001
+From: Helix ARM <helix-arm@localhost>
+Date: Thu, 17 Sep 2026 00:07:27 +0000
+Subject: [PATCH] Keep OMDb optional and honor exact manual selection without
+ metadata
+
+---
+ arm/ripper/movie_selection.py      | 31 +++++++++++++---------
+ arm/ui/metadata.py                 | 10 ++++++--
+ arm_wiki/Movie-selection.md        | 13 ++++++++++
+ test/local/test_movie_selection.py | 41 ++++++++++++++++++++++++++++++
+ 4 files changed, 81 insertions(+), 14 deletions(-)
+
+diff --git a/arm/ripper/movie_selection.py b/arm/ripper/movie_selection.py
+index 067b7c7..d082d35 100644
+--- a/arm/ripper/movie_selection.py
++++ b/arm/ripper/movie_selection.py
+@@ -23,11 +23,29 @@ def select_movie(titles, config, job_id, video_type='movie'):
+                       title_id=None if title is None else title['title_id'])
+         return result
+ 
++    def manual_decision(reason):
++        manual_job = config.get('MOVIE_SELECTION_MANUAL_JOB_ID', -1)
++        manual_inventory = config.get('MOVIE_SELECTION_MANUAL_INVENTORY_SHA256', '')
++        manual_title = config.get('MOVIE_SELECTION_MANUAL_TITLE_ID', -1)
++        if (type(manual_job) is int and manual_job == job_id and manual_inventory == fingerprint
++                and type(manual_title) is int):
++            matches = [r for r in rows if r['title_id'] == manual_title]
++            if len(matches) == 1:
++                return decision('manual', 'JOB_AND_INVENTORY_BOUND_OVERRIDE', matches[0])
++            return decision('operator', 'MANUAL_TITLE_NOT_FOUND')
++        if manual_job != -1 or manual_inventory or manual_title != -1:
++            return decision('operator', 'MANUAL_SCOPE_MISMATCH')
++        return decision('operator', reason)
++
+     if strategy not in ('explicit', 'heuristic', 'manual') or fallback not in ('manual', 'heuristic'):
+         return decision('operator', 'INVALID_POLICY')
+     if not rows or len({r['title_id'] for r in rows}) != len(rows):
+         return decision('operator', 'INVALID_INVENTORY')
+     if video_type != 'movie':
++        # A deliberate exact job/inventory override needs no online classification.
++        # Never treat a marker as proof that an unknown disc is a movie.
++        if video_type == 'unknown' and strategy == 'manual':
++            return manual_decision('MOVIE_CLASSIFICATION_REQUIRED')
+         return decision('operator', 'MOVIE_CLASSIFICATION_REQUIRED')
+ 
+     explicit = [row for row in rows if row['main_feature']]
+@@ -43,15 +61,4 @@ def select_movie(titles, config, job_id, video_type='movie'):
+         return decision('heuristic', reason + '_FALLBACK' if result['strategy'] == 'explicit'
+                         else 'CHAPTERS_SIZE_TITLE_ID', title)
+ 
+-    manual_job = config.get('MOVIE_SELECTION_MANUAL_JOB_ID', -1)
+-    manual_inventory = config.get('MOVIE_SELECTION_MANUAL_INVENTORY_SHA256', '')
+-    manual_title = config.get('MOVIE_SELECTION_MANUAL_TITLE_ID', -1)
+-    if (type(manual_job) is int and manual_job == job_id and manual_inventory == fingerprint
+-            and type(manual_title) is int):
+-        matches = [r for r in rows if r['title_id'] == manual_title]
+-        if len(matches) == 1:
+-            return decision('manual', 'JOB_AND_INVENTORY_BOUND_OVERRIDE', matches[0])
+-        return decision('operator', 'MANUAL_TITLE_NOT_FOUND')
+-    if manual_job != -1 or manual_inventory or manual_title != -1:
+-        return decision('operator', 'MANUAL_SCOPE_MISMATCH')
+-    return decision('operator', reason if result['strategy'] == 'explicit' else 'MANUAL_REQUESTED')
++    return manual_decision(reason if result['strategy'] == 'explicit' else 'MANUAL_REQUESTED')
+diff --git a/arm/ui/metadata.py b/arm/ui/metadata.py
+index d3b2caa..84f408d 100644
+--- a/arm/ui/metadata.py
++++ b/arm/ui/metadata.py
+@@ -21,7 +21,10 @@ def call_omdb_api(title=None, year=None, imdb_id=None, plot="short"):
+     :param plot: if plot should be short/full. Defaults "short"
+     :return: dict of
+     """
+-    omdb_api_key = cfg.arm_config['OMDB_API_KEY']
++    omdb_api_key = cfg.arm_config.get('OMDB_API_KEY')
++    if not isinstance(omdb_api_key, str) or not omdb_api_key.strip():
++        app.logger.info('OMDb metadata unavailable: no API key configured; continuing without enrichment')
++        return None
+     title_info = None
+     # Default url
+     str_url = f"https://www.omdbapi.com/?s={title}&plot={plot}&r=json&apikey={omdb_api_key}"
+@@ -62,7 +65,10 @@ def get_omdb_poster(title=None, year=None, imdb_id=None, plot="short"):
+     :param plot: short or full plot
+     :return: [poster_link, imdb_id]
+     """
+-    omdb_api_key = cfg.arm_config['OMDB_API_KEY']
++    omdb_api_key = cfg.arm_config.get('OMDB_API_KEY')
++    if not isinstance(omdb_api_key, str) or not omdb_api_key.strip():
++        app.logger.info('OMDb poster unavailable: no API key configured')
++        return None, None
+     if imdb_id:
+         str_url = f"https://www.omdbapi.com/?i={imdb_id}&plot={plot}&r=json&apikey={omdb_api_key}"
+         str_url_2 = ""
+diff --git a/arm_wiki/Movie-selection.md b/arm_wiki/Movie-selection.md
+index 9b032b3..97ebd58 100644
+--- a/arm_wiki/Movie-selection.md
++++ b/arm_wiki/Movie-selection.md
+@@ -84,3 +84,16 @@ movie-selection testing. Movie waits poll every5seconds against a monotonic
+ deadline; timeout stops without selecting or ripping. TV waits are unchanged.
+ This is separate from MANUAL_WAIT_TIME (identification/MakeMKV scheduling).
+ Configuration is captured by the job process; it cannot change an active wait.
++
++## Optional online metadata
++
++OMDb enriches names, year, type, IDs and posters; it is not a MakeMKV ripping
++credential. With no OMDB_API_KEY, lookup and poster helpers return no metadata
++without making an unauthenticated request. Existing disc/label values remain.
++GET_VIDEO_TITLE and METADATA_PROVIDER keep their existing roles; no alternative
++provider is selected silently. Missing type still requires operator selection.
++For an unknown disc, MOVIE_SELECTION_STRATEGY: manual can use the existing exact
++job, inventory hash and title-ID override. A stale/missing override stops; known
++series keep their existing routing. The UI also accepts exactly one current-job
++track. Explicit/heuristic policies do not classify an unknown disc from a marker.
++No guessed title order, renamed source identity or automatic enrichment is added.
+diff --git a/test/local/test_movie_selection.py b/test/local/test_movie_selection.py
+index 66ce423..4c3ad54 100644
+--- a/test/local/test_movie_selection.py
++++ b/test/local/test_movie_selection.py
+@@ -271,3 +271,44 @@ class MovieSelectionWait(unittest.TestCase):
+         load('arm/ripper/makemkv.py', {'manual_wait'}, ns)
+         self.assertFalse(ns['manual_wait'](job));self.assertEqual(sleeps,[60]*30)
+         ns['movie_selection_wait'].assert_not_called()
++
++
++class OptionalMetadata(unittest.TestCase):
++    def api(self, key=None, present=True):
++        import urllib.request,urllib.error,urllib.parse
++        from unittest.mock import Mock
++        config={'OMDB_API_KEY':key} if present else {}
++        opener=Mock(side_effect=AssertionError('unconfigured network call'))
++        web=NS(request=NS(urlopen=opener),error=urllib.error,parse=urllib.parse)
++        ns=dict(cfg=NS(arm_config=config),app=NS(logger=Mock()),urllib=web,json=json,
++                requests=NS(utils=NS(requote_uri=lambda x:x)))
++        load('arm/ui/metadata.py', {'call_omdb_api','get_omdb_poster'}, ns)
++        return ns,opener
++
++    def test_missing_empty_and_whitespace_credentials_skip_network(self):
++        for key,present in ((None,False),(None,True),('',True),('  ',True)):
++            ns,opener=self.api(key,present)
++            self.assertIsNone(ns['call_omdb_api']('synthetic'))
++            self.assertEqual(ns['get_omdb_poster']('synthetic'),(None,None))
++            opener.assert_not_called()
++
++    def test_configured_credential_consumed_without_logging_it(self):
++        ns,opener=self.api('synthetic-test-key')
++        opener.side_effect=None;opener.return_value=NS(read=lambda: b'{"Response":"True","Search":[]}')
++        self.assertEqual(ns['call_omdb_api']('synthetic')['Response'],'True')
++        self.assertIn('apikey=synthetic-test-key',opener.call_args.args[0])
++        self.assertNotIn('synthetic-test-key',str(ns['app'].logger.mock_calls))
++
++    def test_absent_metadata_supports_only_exact_manual_override_for_unknown(self):
++        ns,opener=self.api('');self.assertIsNone(ns['call_omdb_api']('synthetic'))
++        rows,_,_=parse_fixture();preview=policy.select_movie(rows,{},4,'unknown')
++        self.assertIsNone(preview['title_id']);self.assertEqual(preview['reason'],'MOVIE_CLASSIFICATION_REQUIRED')
++        config=dict(MOVIE_SELECTION_STRATEGY='manual',MOVIE_SELECTION_MANUAL_JOB_ID=4,
++                    MOVIE_SELECTION_MANUAL_INVENTORY_SHA256=preview['inventory_sha256'],
++                    MOVIE_SELECTION_MANUAL_TITLE_ID=32)
++        selected=policy.select_movie(rows,config,4,'unknown')
++        self.assertEqual((selected['policy'],selected['title_id']),('manual',32))
++        for kind,job,changes in [('unknown',5,{}),('unknown',4,{'MOVIE_SELECTION_MANUAL_INVENTORY_SHA256':'stale'}),
++                                 ('series',4,{}),('unknown',4,{'MOVIE_SELECTION_MANUAL_TITLE_ID':999})]:
++            self.assertIsNone(policy.select_movie(rows,dict(config,**changes),job,kind)['title_id'])
++        opener.assert_not_called()
+-- 
+2.53.0
+

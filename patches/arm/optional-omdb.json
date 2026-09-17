@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "owner": "helix-arm",
+  "patch": "0005-optional-omdb.patch",
+  "patch_sha256": "d9f6bb50da51e00bb111079f86ddfd0e49f78402a04b1ab5635839464887385c",
+  "source_commit": "eafcf289bc6930d2551849c869303a6c916a4a2a",
+  "b70_base_tree": "daa9c109b70e6eab8fa4c5ce843fb93bfa0b44d6",
+  "b70_result_tree": "345675eb21541e9cf494af1741936066283ac8c0",
+  "product_result_tree": "335ae6ad387c2a632e2cb91d6a51fe695858467f",
+  "focused_tests": 25,
+  "b70_tests": 48,
+  "product_tests": 43,
+  "deployment": "NOT_INSTALLED"
+}

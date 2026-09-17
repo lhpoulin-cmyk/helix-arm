@@ -103,3 +103,14 @@ testing. The [manifest](../patches/arm/movie-selection-wait.json) pins replay
 trees. Movie waits poll every5seconds with a monotonic deadline; TV waits remain
 unchanged. MANUAL_WAIT_TIME is a separate identification/scheduling setting.
 No active job is reconfigured, interrupted or automatically selected.
+
+## Optional OMDb and exact manual choices
+
+[0005-optional-omdb.patch](../patches/arm/0005-optional-omdb.patch) skips online
+lookup/poster requests when OMDB_API_KEY is absent or blank. Existing title/label
+values remain; year, type, IDs and posters may be unavailable. Existing policy
+keys remain the interface: MOVIE_SELECTION_STRATEGY manual plus exact job ID,
+inventory SHA-256 and title ID supports an unclassified disc without requiring
+an online account. Incomplete/stale overrides stop; no marker is promoted to
+movie classification. Authenticated current-job UI selection remains supported.
+[The manifest](../patches/arm/optional-omdb.json) pins the incremental replay.

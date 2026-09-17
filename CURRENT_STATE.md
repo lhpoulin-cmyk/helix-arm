@@ -1,3 +1,14 @@
+## 2026-09-17 — Optional metadata and scoped manual selection
+
+OMDb requests now stop locally when its key is absent/empty, with a clear reduced
+metadata message. No secret is logged. Exact manual job/inventory/title overrides
+now work for unknown classification; automatic policies still require movie
+classification and known series routing is unchanged. This corrects a selector
+gate that previously rejected a valid manual override before examining it.
+Independent replay passes48 B70 tests and43 product tests, including25 focused
+selection/metadata tests. No runtime installation or disc operation occurred.
+The additive0005 patch follows0004; arm-cp owns deployment and recovery.
+
 ## 2026-09-16 — Configurable movie-selection wait (prepared)
 
 MOVIE_SELECTION_WAIT_SECONDS defaults to1800; testing may set60. Movie waits
